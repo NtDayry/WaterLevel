@@ -1,0 +1,14 @@
+SET(SOURCES screens/ui_Screen1.c
+    ui.c
+    components/ui_comp_hook.c
+    ui_helpers.c
+    images/ui_img_house_png.c
+    images/ui_img_1329202414.c
+    images/ui_img_1575836844.c
+    fonts/ui_font_Font1.c
+    fonts/ui_font_Font2.c
+    fonts/ui_font_Font23.c
+    fonts/ui_font_Font3.c
+    fonts/ui_font_FontTH.c)
+
+add_library(ui ${SOURCES})

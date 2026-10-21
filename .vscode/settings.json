@@ -1,0 +1,20 @@
+{
+    "files.associations": {
+        "functional": "cpp",
+        "ui.h": "c",
+        "cmath": "cpp",
+        "chrono": "cpp",
+        "algorithm": "cpp",
+        "optional": "cpp",
+        "istream": "cpp",
+        "ostream": "cpp",
+        "ratio": "cpp",
+        "system_error": "cpp",
+        "array": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp"
+    },
+    "cmake.sourceDirectory": "C:/Users/ratta/OneDrive/Documents/Project/HOME_BOTTLE/Countter_1/src/ui",
+    "C_Cpp.errorSquiggles": "enabled"
+}
