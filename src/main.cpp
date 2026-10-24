@@ -21,13 +21,20 @@
 #include "waveshare_sdcard.h"
 #include <Arduino.h>
 #include <ModbusMaster.h>
+#include <Preferences.h>
 #include <lv_conf.h>
 #include <lvgl.h>
 #include <math.h>
 
-// Set to 0 when a real Modbus device is connected.
+// Real RS485 devices are connected on this installation.
 #ifndef WATER_LEVEL_SIMULATION
-#define WATER_LEVEL_SIMULATION 1
+#define WATER_LEVEL_SIMULATION 0
+#endif
+
+// The level sensor is now part of the live system. Set to 0 only when testing
+// with the IO module alone, because a missing slave causes a Modbus timeout.
+#ifndef WATER_LEVEL_SENSOR_PRESENT
+#define WATER_LEVEL_SENSOR_PRESENT 0
 #endif
 
 // Include Waveshare 4.3B Library (RS485, CAN, I2C, IO Expander)
@@ -36,13 +43,15 @@
 // =============================================================================
 // Modbus RTU Configuration
 // =============================================================================
-volatile uint8_t MODBUS_SLAVE_ID = 1;        // Target Modbus Slave ID (1-247)
+volatile uint8_t MODBUS_SLAVE_ID = 2;        // Water-level sensor slave ID
+static const uint8_t RS485_IO_SLAVE_ID = 3;
 volatile uint32_t MODBUS_BAUD_RATE = 9600;   // Standard Baud Rate (เช่น 9600, 19200, 115200)
 volatile uint16_t MODBUS_START_REG = 0x0000; // Register เริ่มต้น
 volatile uint16_t MODBUS_REG_COUNT = 2;      // จำนวน Register ที่ต้องการอ่าน
-volatile uint32_t MODBUS_POLL_MS = 2000;     // อ่านค่าทุก 2 วินาที
+volatile uint32_t MODBUS_POLL_MS = 200;      // อ่านค่าทุก 200 ms
 
 ModbusMaster modbus;
+ModbusMaster rs485Io;
 
 // FreeRTOS Task and Queue Handles
 TaskHandle_t commTaskHandle = NULL;
@@ -52,6 +61,7 @@ QueueHandle_t logQueue = NULL;
 volatile bool requestScanModbus = false;
 volatile int8_t pendingCoilIndex = -1;
 volatile bool pendingCoilState = false;
+volatile uint8_t pendingIoMask = 0;
 
 // Shared State between Core 0 and Core 1
 volatile bool shared_di0 = false;
@@ -61,11 +71,41 @@ volatile bool di1_changed = false;
 volatile uint16_t shared_reg0 = 1500;
 volatile uint16_t shared_reg1 = 285;
 volatile bool reg_data_updated = false;
+volatile uint8_t shared_rs485_inputs = 0;
+volatile uint8_t shared_rs485_outputs = 0;
+volatile bool shared_pressure_switch = false;
+volatile bool rs485_io_ok = false;
+volatile bool sensor_rs485_ok = false;
 
 // Water-level gauge created inside the SquareLine placeholder object.
 static lv_chart_series_t *waterLevelChartSeries = NULL;
 static uint32_t lastSimulationUpdateMs = 0;
 static float simulatedLevelPct = 60.0f;
+
+// Persistent process settings. Values are percentages of the 0-100% tank
+// range; the UI text areas are intentionally kept as the source of truth for
+// editing, while these values are used by the control loop.
+struct WaterSettings {
+    float valveOnCm = 84.0f;
+    float tankCapacity = 2000.0f;
+    uint32_t valvePeriodSec = 300;
+    float alertMinCm = 40.0f;
+    float alertMaxCm = 180.0f;
+    uint32_t alertPeriodSec = 300;
+    bool autoMode = false;
+    bool autoPump1 = false;
+    bool autoPump2 = false;
+};
+
+static Preferences settingsStore;
+static WaterSettings waterSettings;
+static bool manualValveOverride = false;
+static uint32_t alertLowSince = 0;
+static uint32_t alertHighSince = 0;
+static bool alertOutputOn = false;
+static bool lastRs485Ok = false;
+
+static void set_status_led(lv_obj_t *led, bool enabled, uint32_t on_color);
 
 struct LogItem {
     char text[128];
@@ -83,6 +123,169 @@ void logMsg(const char *msg) {
 }
 
 void logMsg(const String &str) { logMsg(str.c_str()); }
+
+static float boundedFloat(const char *text, float fallback, float minValue, float maxValue) {
+    if (!text || !*text)
+        return fallback;
+    char *end = nullptr;
+    const float value = strtof(text, &end);
+    if (end == text || !isfinite(value))
+        return fallback;
+    return value < minValue ? minValue : (value > maxValue ? maxValue : value);
+}
+
+static uint32_t boundedUint(const char *text, uint32_t fallback, uint32_t minValue, uint32_t maxValue) {
+    if (!text || !*text)
+        return fallback;
+    char *end = nullptr;
+    const long value = strtol(text, &end, 10);
+    if (end == text)
+        return fallback;
+    return (uint32_t)(value < (long)minValue ? minValue : (value > (long)maxValue ? maxValue : value));
+}
+
+static void load_water_settings() {
+    settingsStore.begin("watercfg", false);
+    waterSettings.valveOnCm = settingsStore.getFloat("voncm", waterSettings.valveOnCm);
+    waterSettings.tankCapacity = settingsStore.getFloat("tankcap", waterSettings.tankCapacity);
+    waterSettings.valvePeriodSec = settingsStore.getUInt("vperiod", waterSettings.valvePeriodSec);
+    waterSettings.alertMinCm = settingsStore.getFloat("amincm", waterSettings.alertMinCm);
+    waterSettings.alertMaxCm = settingsStore.getFloat("amaxcm", waterSettings.alertMaxCm);
+    waterSettings.alertPeriodSec = settingsStore.getUInt("aperiod", waterSettings.alertPeriodSec);
+    waterSettings.autoMode = settingsStore.getBool("automode", waterSettings.autoMode);
+    waterSettings.autoPump1 = settingsStore.getBool("apump1", waterSettings.autoPump1);
+    waterSettings.autoPump2 = settingsStore.getBool("apump2", waterSettings.autoPump2);
+    settingsStore.end();
+
+    waterSettings.valveOnCm = constrain(waterSettings.valveOnCm, 0.0f, 200.0f);
+    waterSettings.tankCapacity = constrain(waterSettings.tankCapacity, 0.1f, 1000000.0f);
+    waterSettings.alertMinCm = constrain(waterSettings.alertMinCm, 0.0f, 200.0f);
+    waterSettings.alertMaxCm = constrain(waterSettings.alertMaxCm, 0.0f, 200.0f);
+    waterSettings.valvePeriodSec = constrain(waterSettings.valvePeriodSec, (uint32_t)1, (uint32_t)86400);
+    waterSettings.alertPeriodSec = constrain(waterSettings.alertPeriodSec, (uint32_t)1, (uint32_t)86400);
+    const float maxLevelCm = max(1.0f, waterSettings.tankCapacity);
+    waterSettings.valveOnCm = min(waterSettings.valveOnCm, maxLevelCm);
+    waterSettings.alertMinCm = min(waterSettings.alertMinCm, maxLevelCm);
+    waterSettings.alertMaxCm = min(waterSettings.alertMaxCm, maxLevelCm);
+    if (waterSettings.alertMinCm >= waterSettings.alertMaxCm)
+        waterSettings.alertMaxCm = min(200.0f, waterSettings.alertMinCm + 1.0f);
+}
+
+static void save_water_settings() {
+    settingsStore.begin("watercfg", false);
+    settingsStore.putFloat("voncm", waterSettings.valveOnCm);
+    settingsStore.putFloat("tankcap", waterSettings.tankCapacity);
+    settingsStore.putUInt("vperiod", waterSettings.valvePeriodSec);
+    settingsStore.putFloat("amincm", waterSettings.alertMinCm);
+    settingsStore.putFloat("amaxcm", waterSettings.alertMaxCm);
+    settingsStore.putUInt("aperiod", waterSettings.alertPeriodSec);
+    settingsStore.putBool("automode", waterSettings.autoMode);
+    settingsStore.putBool("apump1", waterSettings.autoPump1);
+    settingsStore.putBool("apump2", waterSettings.autoPump2);
+    settingsStore.end();
+}
+
+static void set_textarea_number(lv_obj_t *textarea, float value, uint8_t decimals = 0) {
+    if (!textarea)
+        return;
+    char text[20];
+    snprintf(text, sizeof(text), decimals ? "%.1f" : "%.0f", value);
+    lv_textarea_set_text(textarea, text);
+}
+
+static void update_settings_ui() {
+    set_textarea_number(ui_SetOnValve, waterSettings.valveOnCm, 1);
+    set_textarea_number(ui_SetTankCapacity, waterSettings.tankCapacity, 1);
+    set_textarea_number(ui_SetPeriodTimeContorl, (float)waterSettings.valvePeriodSec);
+    set_textarea_number(ui_SetMinAlert, waterSettings.alertMinCm, 1);
+    set_textarea_number(ui_SetMaxAlert, waterSettings.alertMaxCm, 1);
+    set_textarea_number(ui_SetPeriodTimeAlert, (float)waterSettings.alertPeriodSec);
+    if (ui_LabelLimits) {
+        char limits[64];
+        snprintf(limits, sizeof(limits), "ALERT MIN: %.1f cm | MAX: %.1f cm", waterSettings.alertMinCm, waterSettings.alertMaxCm);
+        lv_label_set_text(ui_LabelLimits, limits);
+    }
+}
+
+static float configuredLevelMaxCm() {
+    return max(1.0f, waterSettings.tankCapacity);
+}
+
+static void update_mode_ui() {
+    if (ui_ManualAuto)
+        lv_obj_set_state(ui_ManualAuto, LV_STATE_CHECKED, waterSettings.autoMode);
+    if (ui_AutoPump1)
+        lv_obj_set_state(ui_AutoPump1, LV_STATE_CHECKED, waterSettings.autoPump1);
+    if (ui_AutoPump2)
+        lv_obj_set_state(ui_AutoPump2, LV_STATE_CHECKED, waterSettings.autoPump2);
+    const bool autoMode = waterSettings.autoMode;
+    for (lv_obj_t *obj : {ui_ManualPump1, ui_ManualPump2, ui_ManualValve}) {
+        if (!obj) continue;
+        if (autoMode) lv_obj_add_state(obj, LV_STATE_DISABLED);
+        else lv_obj_clear_state(obj, LV_STATE_DISABLED);
+    }
+}
+
+static void save_settings_from_ui(lv_event_t *) {
+    const float maxLevelCm = configuredLevelMaxCm();
+    waterSettings.valveOnCm = boundedFloat(lv_textarea_get_text(ui_SetOnValve), waterSettings.valveOnCm, 0.0f, maxLevelCm);
+    waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
+    waterSettings.valvePeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 1, 86400);
+    waterSettings.alertMinCm = boundedFloat(lv_textarea_get_text(ui_SetMinAlert), waterSettings.alertMinCm, 0.0f, maxLevelCm);
+    waterSettings.alertMaxCm = boundedFloat(lv_textarea_get_text(ui_SetMaxAlert), waterSettings.alertMaxCm, 0.0f, maxLevelCm);
+    waterSettings.alertPeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeAlert), waterSettings.alertPeriodSec, 1, 86400);
+
+    if (waterSettings.alertMinCm >= waterSettings.alertMaxCm)
+        waterSettings.alertMaxCm = min(200.0f, waterSettings.alertMinCm + 1.0f);
+    update_settings_ui();
+    save_water_settings();
+}
+
+static void save_mode_settings(lv_event_t *) {
+    waterSettings.autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+    waterSettings.autoPump1 = ui_AutoPump1 && lv_obj_has_state(ui_AutoPump1, LV_STATE_CHECKED);
+    waterSettings.autoPump2 = ui_AutoPump2 && lv_obj_has_state(ui_AutoPump2, LV_STATE_CHECKED);
+    if (waterSettings.autoMode)
+        manualValveOverride = false;
+    for (lv_obj_t *obj : {ui_ManualPump1, ui_ManualPump2, ui_ManualValve}) {
+        if (!obj) continue;
+        if (waterSettings.autoMode) lv_obj_add_state(obj, LV_STATE_DISABLED);
+        else lv_obj_clear_state(obj, LV_STATE_DISABLED);
+    }
+    save_water_settings();
+}
+
+// The SquareLine keyboard is a shared numeric keypad for all setting fields.
+// The actual field being edited is kept separately so the keyboard display can
+// be edited without changing the setting until OK/Enter is pressed.
+static lv_obj_t *activeNumericInput = nullptr;
+
+static void open_numeric_keyboard(lv_event_t *e) {
+    activeNumericInput = (lv_obj_t *)lv_event_get_target(e);
+    if (!activeNumericInput || !ui_ContainerKeyboard || !ui_KeyboardDisplay || !ui_Keyboard)
+        return;
+
+    lv_textarea_set_text(ui_KeyboardDisplay, lv_textarea_get_text(activeNumericInput));
+    lv_keyboard_set_textarea(ui_Keyboard, ui_KeyboardDisplay);
+    lv_keyboard_set_mode(ui_Keyboard, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_clear_flag(ui_ContainerKeyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_state(ui_KeyboardDisplay, LV_STATE_FOCUSED);
+    lv_textarea_set_cursor_pos(ui_KeyboardDisplay, LV_TEXTAREA_CURSOR_LAST);
+}
+
+static void close_numeric_keyboard(lv_event_t *e) {
+    if (!activeNumericInput || !ui_KeyboardDisplay)
+        return;
+
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        lv_textarea_set_text(activeNumericInput, lv_textarea_get_text(ui_KeyboardDisplay));
+        save_settings_from_ui(nullptr);
+    }
+    lv_obj_add_flag(ui_ContainerKeyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_state(ui_KeyboardDisplay, LV_STATE_FOCUSED);
+    activeNumericInput = nullptr;
+}
 
 // Translate Modbus error code to readable string
 const char *getModbusErrorStr(uint8_t errCode) {
@@ -130,6 +333,8 @@ void doModbusPoll() {
     }
 
     if (result == modbus.ku8MBSuccess) {
+        sensor_rs485_ok = true;
+        lastRs485Ok = true;
         lastLoggedErr = 0xFF;
         char buf[128];
         snprintf(buf, sizeof(buf), "[MB OK] ID:%d %s | R0=%u R1=%u\n", MODBUS_SLAVE_ID, isInputReg ? "InReg" : "HoldReg", modbus.getResponseBuffer(0),
@@ -150,6 +355,8 @@ void doModbusPoll() {
         canData[4] = (uint8_t)(v1 & 0xFF);
         WS43B.can.send(0x400, canData, 5);
     } else {
+        sensor_rs485_ok = false;
+        lastRs485Ok = false;
         // พิมพ์ออก Serial เสมอ แต่ขึ้นหน้าจอเฉพาะเมื่อ error มีการเปลี่ยนแปลงเพื่อลดภาระจอ
         char buf[128];
         snprintf(buf, sizeof(buf), "[MB ERR 0x%02X] %s\n", result, getModbusErrorStr(result));
@@ -160,6 +367,26 @@ void doModbusPoll() {
             logMsg(buf);
         }
     }
+}
+
+static void pollRs485Io() {
+    rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
+    WS43B.rs485.clearRxBuffer();
+    const uint8_t inputResult = rs485Io.readDiscreteInputs(0, 8); // 1x: addresses 0..7
+    if (inputResult != rs485Io.ku8MBSuccess) {
+        rs485_io_ok = false;
+        return;
+    }
+    // Slave 3 is online as soon as the required 8-channel input read works.
+    // Some IO modules do not implement function 0x01 (read coils), even
+    // though they support function 0x0F for writing all eight outputs.
+    rs485_io_ok = true;
+    shared_rs485_inputs = (uint8_t)(rs485Io.getResponseBuffer(0) & 0xFF);
+    shared_pressure_switch = (shared_rs485_inputs & (1u << 1)) != 0; // DI address 1
+
+    // This IO module is verified to support 0x0F write-multiple-coils, but
+    // does not need 0x01 read-coils for operation. Keep the output shadow from
+    // the successful 0x0F response to avoid a timeout on every IO poll.
 }
 
 void doModbusScan() {
@@ -209,18 +436,26 @@ void doModbusScan() {
 void commTask(void *param) {
     Serial.printf("[TASK] Communication Task running on Core %d\n", xPortGetCoreID());
 
-    unsigned long lastPollTime = 0;
+    // Give the IO slave the bus first at boot; a missing sensor must not block
+    // the first manual output command for the Modbus timeout period.
+    unsigned long lastPollTime = millis();
     unsigned long lastDIPollTime = 0;
     uint8_t local_last_di0 = 0xFF;
     uint8_t local_last_di1 = 0xFF;
 
     while (true) {
         // 1. จัดการคำขอเขียน Coil (จาก UI สวิตช์ DO0/DO1)
-        if (pendingCoilIndex >= 0) {
-            int8_t coil = pendingCoilIndex;
-            bool state = pendingCoilState;
-            pendingCoilIndex = -1; // Clear flag
-            modbus.writeSingleCoil(coil, state ? 1 : 0);
+        if (pendingIoMask != 0) {
+            pendingIoMask = 0;
+            rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
+            // The IO module requires all eight outputs in one transaction.
+            // ModbusMaster packs coil states from transmit buffer word 0.
+            rs485Io.setTransmitBuffer(0, shared_rs485_outputs & 0xFF);
+            const uint8_t result = rs485Io.writeMultipleCoils(0, 8); // 0x0F, coils 0..7
+            if (result == rs485Io.ku8MBSuccess)
+                rs485_io_ok = true;
+            else
+                rs485_io_ok = false;
         }
 
         // 2. จัดการคำขอสแกนหา Slave ID (จากปุ่ม SCAN MB)
@@ -231,12 +466,18 @@ void commTask(void *param) {
         }
 
         // 3. รอบอ่านค่า Modbus อัตโนมัติตามรอบเวลา
-#if !WATER_LEVEL_SIMULATION
-        if (millis() - lastPollTime >= MODBUS_POLL_MS) {
+#if !WATER_LEVEL_SIMULATION && WATER_LEVEL_SENSOR_PRESENT
+        const uint32_t sensorPollInterval = sensor_rs485_ok ? MODBUS_POLL_MS : 5000UL;
+        if (millis() - lastPollTime >= sensorPollInterval) {
             lastPollTime = millis();
             doModbusPoll();
         }
 #endif
+        static unsigned long lastIoPollTime = 0;
+        if (millis() - lastIoPollTime >= 50) {
+            lastIoPollTime = millis();
+            pollRs485Io();
+        }
 
         // 4. รับและประมวลผลเฟรม CAN Bus (TWAI)
         twai_message_t canRx;
@@ -321,6 +562,208 @@ void DO1_OUTPUT(lv_event_t *e) {
     logMsg(state ? "[DO1] -> ON\n" : "[DO1] -> OFF\n");
 }
 
+static void set_output_state(uint8_t output, bool on) {
+    if (output == 0) {
+        if (on)
+            DO0_ON;
+        else
+            DO0_OFF;
+    } else {
+        if (on)
+            DO1_ON;
+        else
+            DO1_OFF;
+    }
+}
+
+static void set_rs485_output(uint8_t coil, bool on) {
+    if (coil > 7)
+        return;
+    const uint8_t mask = (uint8_t)(1u << coil);
+    const bool current = (shared_rs485_outputs & mask) != 0;
+    if (current == on)
+        return;
+    // Update the shadow immediately so a single control pass can queue
+    // several different coils without one command replacing another.
+    if (on) shared_rs485_outputs |= mask;
+    else shared_rs485_outputs &= (uint8_t)~mask;
+    pendingIoMask |= mask;
+}
+
+static void update_auto_pumps_from_pressure() {
+    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+    if (!autoMode)
+        return;
+
+    // Pressure switch DI address 1 is the single source of truth for Auto
+    // pump requests. The output shadow is updated immediately and the comm
+    // task sends all eight coils in one 0x0F transaction.
+    set_rs485_output(1, shared_pressure_switch && waterSettings.autoPump1);
+    set_rs485_output(2, shared_pressure_switch && waterSettings.autoPump2);
+}
+
+static bool update_automatic_outputs(float levelCm) {
+    static bool valveOn = false;
+    static uint32_t valveLowSince = 0;
+    static uint32_t valveHighSince = 0;
+    const uint32_t now = millis();
+    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+
+    if (autoMode && !manualValveOverride) {
+        if (!valveOn && levelCm <= waterSettings.valveOnCm) {
+            if (valveLowSince == 0)
+                valveLowSince = now;
+            if (now - valveLowSince >= waterSettings.valvePeriodSec * 1000UL)
+                valveOn = true;
+        } else {
+            valveLowSince = 0;
+        }
+        // SetOnValve is the fill target: close the valve after the level
+        // reaches the configured value, using the same continuous period.
+        if (valveOn && levelCm >= waterSettings.valveOnCm) {
+            if (valveHighSince == 0)
+                valveHighSince = now;
+            if (now - valveHighSince >= waterSettings.valvePeriodSec * 1000UL)
+                valveOn = false;
+        } else {
+            valveHighSince = 0;
+        }
+        set_rs485_output(0, valveOn); // RS485 coil 0 is the water valve.
+        update_auto_pumps_from_pressure();
+    } else if (!autoMode) {
+        valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
+    }
+
+    const bool lowCondition = levelCm <= waterSettings.alertMinCm;
+    const bool highCondition = levelCm >= waterSettings.alertMaxCm;
+    if (lowCondition) {
+        if (alertLowSince == 0)
+            alertLowSince = now;
+    } else {
+        alertLowSince = 0;
+    }
+    if (highCondition) {
+        if (alertHighSince == 0)
+            alertHighSince = now;
+    } else {
+        alertHighSince = 0;
+    }
+
+    const uint32_t requiredMs = waterSettings.alertPeriodSec * 1000UL;
+    const bool timedOut = (alertLowSince != 0 && now - alertLowSince >= requiredMs) ||
+                          (alertHighSince != 0 && now - alertHighSince >= requiredMs);
+    alertOutputOn = timedOut;
+    set_rs485_output(3, alertOutputOn); // RS485 coil 3 is the alarm output.
+    return valveOn;
+}
+
+static void update_manual_leds() {
+    const bool localDo0On = DO_Read(DO0) == 0;
+    const bool localDo1On = DO_Read(DO1) == 0;
+    auto set_monitor_alpha = [](lv_obj_t *obj, bool on) {
+        if (obj)
+            lv_obj_set_style_bg_opa(obj, on ? LV_OPA_COVER : 100, LV_PART_MAIN | LV_STATE_DEFAULT);
+    };
+
+    // This LED reports the actual Modbus slave 3 transaction status, so it
+    // remains useful even when the water-level sensor (slave 2) is absent.
+    set_status_led(ui_LedMeter485, lastRs485Ok, 0x22C55E);
+    set_status_led(ui_LedLevel485, lastRs485Ok, 0x22C55E);
+    set_status_led(ui_LedIO485, rs485_io_ok, 0x22C55E);
+    set_status_led(ui_LedValve, (shared_rs485_outputs & (1u << 0)) != 0, 0x22C55E);
+    set_status_led(ui_LedPump1, (shared_rs485_outputs & (1u << 1)) != 0, 0x22C55E);
+    set_status_led(ui_LedPump2, (shared_rs485_outputs & (1u << 2)) != 0, 0x22C55E);
+
+    // Keep the three manual controls as status indicators as well as controls.
+    // This also reflects automatic output changes while the Manual panel is
+    // open; disabled controls in Auto mode still show the real state.
+    if (ui_ManualPump1)
+        lv_obj_set_state(ui_ManualPump1, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 1)) != 0);
+    if (ui_ManualPump2)
+        lv_obj_set_state(ui_ManualPump2, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 2)) != 0);
+    if (ui_ManualValve)
+        lv_obj_set_state(ui_ManualValve, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 0)) != 0);
+
+    set_monitor_alpha(ui_LocalDI0, shared_di0);
+    set_monitor_alpha(ui_LocalDI1, shared_di1);
+    set_monitor_alpha(ui_LocalDO0, localDo0On);
+    set_monitor_alpha(ui_LocalDO1, localDo1On);
+    lv_obj_t *rs485Di[] = {ui_RS485DI0, ui_RS485DI1, ui_RS485DI2, ui_RS485DI3, ui_RS485DI4, ui_RS485DI5, ui_RS485DI6, ui_RS485DI7};
+    lv_obj_t *rs485Do[] = {ui_RS485DO0, ui_RS485DO1, ui_RS485DO2, ui_RS485DO3, ui_RS485DO4, ui_RS485DO5, ui_RS485DO6, ui_RS485DO7};
+    for (uint8_t i = 0; i < 8; ++i) {
+        set_monitor_alpha(rs485Di[i], rs485_io_ok && ((shared_rs485_inputs >> i) & 1));
+        set_monitor_alpha(rs485Do[i], rs485_io_ok && ((shared_rs485_outputs >> i) & 1));
+    }
+}
+
+static void manual_output_event(lv_event_t *e) {
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+    const bool state = lv_obj_has_state(obj, LV_STATE_CHECKED);
+    void *userData = lv_event_get_user_data(e);
+    const uint8_t output = (uint8_t)(uintptr_t)userData;
+    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+    if (autoMode)
+        return;
+    if (output == 2) {
+        manualValveOverride = true;
+        set_rs485_output(0, state);
+    } else {
+        set_rs485_output((uint8_t)(output + 1), state);
+    }
+    update_manual_leds();
+}
+
+static void local_output_test_event(lv_event_t *e) {
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+    const uint8_t output = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    const bool state = !lv_obj_has_state(obj, LV_STATE_CHECKED);
+    lv_obj_set_state(obj, LV_STATE_CHECKED, state);
+    set_output_state(output, state);
+    update_manual_leds();
+}
+
+static void rs485_output_test_event(lv_event_t *e) {
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+    const uint8_t coil = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    const bool state = !lv_obj_has_state(obj, LV_STATE_CHECKED);
+    lv_obj_set_state(obj, LV_STATE_CHECKED, state);
+    set_rs485_output(coil, state);
+    update_manual_leds();
+}
+
+static void select_panel(lv_obj_t *panel) {
+    if (!panel)
+        return;
+    lv_obj_add_flag(ui_LineChart, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_PanelManual, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_PanelMonitor, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void select_chart(lv_event_t *) {
+    select_panel(ui_LineChart);
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "LEVEL AND FLOW TREND (REAL-TIME)");
+}
+
+static void select_settings(lv_event_t *) {
+    update_settings_ui();
+    select_panel(ui_PanelSettings);
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "Settings");
+}
+
+static void select_manual(lv_event_t *) {
+    select_panel(ui_PanelManual);
+    update_manual_leds();
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "Manual");
+}
+
+static void select_monitor(lv_event_t *) {
+    select_panel(ui_PanelMonitor);
+    update_manual_leds();
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "Monitor");
+}
+
 void toggleBacklight(lv_event_t *e) {
     lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
     bool state = lv_obj_has_state(obj, LV_STATE_CHECKED);
@@ -346,13 +789,14 @@ static lv_coord_t waterTankMaxHeight = 285; // Maximum height of the water tank 
 static void set_status_led(lv_obj_t *led, bool enabled, uint32_t on_color) {
     if (!led)
         return;
+    lv_obj_set_style_bg_opa(led, enabled ? LV_OPA_COVER : 50, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(led, enabled ? lv_color_hex(on_color) : lv_color_hex(0x3F0F16), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_color(led, enabled ? lv_color_hex(on_color) : lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_width(led, enabled ? 16 : 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_shadow_opa(led, enabled ? LV_OPA_60 : LV_OPA_0, LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
-static void update_water_level_ui(float level_pct, float level_cm, uint16_t volume_l, uint16_t flow_rate, bool valve_on, bool pump1_on,
+static void update_water_level_ui(float level_pct, float level_cm, float volume_l, float flow_rate, bool valve_on, bool pump1_on,
                                   bool pump2_on) {
     if (!ui_WaterTank)
         return;
@@ -380,24 +824,24 @@ static void update_water_level_ui(float level_pct, float level_cm, uint16_t volu
     if (ui_LabelWaterCm)
         lv_label_set_text(ui_LabelWaterCm, text);
 
-    snprintf(text, sizeof(text), "%u", volume_l);
+    snprintf(text, sizeof(text), "%.3f", volume_l);
     if (ui_LabelVolumn)
         lv_label_set_text(ui_LabelVolumn, text);
 
-    snprintf(text, sizeof(text), "%u", flow_rate);
+    snprintf(text, sizeof(text), "%.3f", flow_rate);
     if (ui_LabelFlowRate)
         lv_label_set_text(ui_LabelFlowRate, text);
 
-    set_status_led(ui_LedValve, valve_on, 0xF59E0B);
+    set_status_led(ui_LedValve, valve_on, 0x22C55E);
     set_status_led(ui_LedPump1, pump1_on, 0x22C55E);
-    set_status_led(ui_LedPump2, pump2_on, 0x38BDF8);
+    set_status_led(ui_LedPump2, pump2_on, 0x22C55E);
 
-    if (level_pct < 20.0f) {
+    if (level_cm < waterSettings.alertMinCm) {
         lv_label_set_text(ui_LabelWaterStatus, "LOW LEVEL");
         lv_obj_set_style_bg_color(ui_PanelWaterStatus, lv_color_hex(0x78350F), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_color(ui_PanelWaterStatus, lv_color_hex(0xF59E0B), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_color(ui_LabelWaterStatus, lv_color_hex(0xF59E0B), LV_PART_MAIN | LV_STATE_DEFAULT);
-    } else if (level_pct >= 90.0f) {
+    } else if (level_cm >= waterSettings.alertMaxCm) {
         lv_label_set_text(ui_LabelWaterStatus, "HIGH LEVEL");
         lv_obj_set_style_bg_color(ui_PanelWaterStatus, lv_color_hex(0x7F1D1D), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_border_color(ui_PanelWaterStatus, lv_color_hex(0xEF4444), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -410,23 +854,6 @@ static void update_water_level_ui(float level_pct, float level_cm, uint16_t volu
     }
 }
 
-static void setup_water_level_simulation() {
-    if (!ui_LineChart)
-        return;
-
-    lv_chart_set_range(ui_LineChart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-    // The SquareLine-generated series uses a 10-element external array while
-    // this chart has 20 points. Hide it and use a chart-owned 20-point series
-    // so the simulation never writes past the generated buffer.
-    lv_chart_series_t *generatedSeries = lv_chart_get_series_next(ui_LineChart, NULL);
-    if (generatedSeries)
-        lv_chart_hide_series(ui_LineChart, generatedSeries, true);
-    waterLevelChartSeries = lv_chart_add_series(ui_LineChart, lv_color_hex(0x22D3EE), LV_CHART_AXIS_PRIMARY_Y);
-    if (waterLevelChartSeries) {
-        lv_chart_set_all_values(ui_LineChart, waterLevelChartSeries, 60);
-    }
-    lastSimulationUpdateMs = 0;
-}
 
 static void update_water_level_simulation() {
 #if WATER_LEVEL_SIMULATION
@@ -444,14 +871,15 @@ static void update_water_level_simulation() {
 
     const float level_pct = simulatedLevelPct;
     const float level_cm = level_pct * 2.0f;                        // 200 cm tank
-    const uint16_t volume_l = (uint16_t)(level_pct * 20.0f + 0.5f); // 2,000 L tank
-    int flow = (int)(100.0f + level_pct * 1.8f) + random(-25, 26);
+    const float volume_l = (level_pct / 100.0f) * waterSettings.tankCapacity;
+    float flow = 100.0f + level_pct * 1.8f + (float)random(-25, 26);
     if (flow < 0)
         flow = 0;
-    const uint16_t flow_rate = (uint16_t)flow;
-    const bool valve_on = level_pct < 42.0f;
-    const bool pump1_on = level_pct < 50.0f;
-    const bool pump2_on = level_pct > 78.0f;
+    const float flow_rate = flow;
+    const bool valve_on = update_automatic_outputs(level_cm);
+    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+    const bool pump1_on = autoMode && waterSettings.autoPump1 && shared_pressure_switch;
+    const bool pump2_on = autoMode && waterSettings.autoPump2 && shared_pressure_switch;
 
     if (lvgl_port_lock(10)) {
         update_water_level_ui(level_pct, level_cm, volume_l, flow_rate, valve_on, pump1_on, pump2_on);
@@ -461,13 +889,57 @@ static void update_water_level_simulation() {
 }
 
 void setup_ui_events() {
-    return;
-    // lv_obj_add_event_cb(ui_DO1, DO0_OUTPUT, LV_EVENT_VALUE_CHANGED, NULL);
-    // lv_obj_add_event_cb(ui_DO2, DO1_OUTPUT, LV_EVENT_VALUE_CHANGED, NULL);
-    // lv_obj_add_event_cb(ui_backlight, toggleBacklight, LV_EVENT_VALUE_CHANGED, NULL);
-    // if (ui_Button2) {
-    //     lv_obj_add_event_cb(ui_Button2, onButtonAction, LV_EVENT_CLICKED, NULL);
-    // }
+    lv_obj_add_event_cb(ui_HomeButton, select_chart, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SettingsButton, select_settings, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_ManualButton, select_manual, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_MonitorButton, select_monitor, LV_EVENT_CLICKED, NULL);
+    // SquareLine marks the child images as clickable, so a touch on an icon
+    // may target the image instead of bubbling to its button parent.
+    lv_obj_add_event_cb(ui_Image1, select_chart, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Image2, select_settings, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Image3, select_manual, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Image4, select_monitor, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
+
+    lv_obj_add_event_cb(ui_SetOnValve, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetTankCapacity, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetMinAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetMaxAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Keyboard, close_numeric_keyboard, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_Keyboard, close_numeric_keyboard, LV_EVENT_CANCEL, NULL);
+
+    lv_obj_add_event_cb(ui_ManualPump1, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)0);
+    lv_obj_add_event_cb(ui_ManualPump2, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)1);
+    lv_obj_add_event_cb(ui_ManualValve, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)2);
+    lv_obj_add_event_cb(ui_ManualAuto, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(ui_AutoPump1, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(ui_AutoPump2, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
+    for (lv_obj_t *obj : {ui_LocalDO0, ui_LocalDO1})
+        if (obj) lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ui_LocalDO0, local_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)0);
+    lv_obj_add_event_cb(ui_LocalDO1, local_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)1);
+    lv_obj_t *rs485Do[] = {ui_RS485DO0, ui_RS485DO1, ui_RS485DO2, ui_RS485DO3,
+                           ui_RS485DO4, ui_RS485DO5, ui_RS485DO6, ui_RS485DO7};
+    for (uint8_t i = 0; i < 8; ++i) {
+        if (rs485Do[i]) lv_obj_add_flag(rs485Do[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(rs485Do[i], rs485_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+    }
+    select_panel(ui_LineChart);
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "LEVEL AND FLOW TREND (REAL-TIME)");
 }
 
 // -----------------------------------------------------------------------------
@@ -496,6 +968,7 @@ void setup() {
 
     // 5. เริ่มต้น ModbusMaster โดยผูกเข้ากับ Serial1
     modbus.begin(MODBUS_SLAVE_ID, Serial1);
+    rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
 
     // 6. เริ่มต้น CAN Bus (TWAI: GPIO 15 TX, GPIO 16 RX)
     bool canOk = WS43B.can.begin(500000);
@@ -503,25 +976,15 @@ void setup() {
     // 7. เริ่มต้น UI หน้าจอ
     lvgl_port_lock(-1);
     ui_init();
+    load_water_settings();
+    update_settings_ui();
+    update_mode_ui();
+#if WATER_LEVEL_SIMULATION
     setup_water_level_simulation();
-    // randomSeed((uint32_t)micros());
-    // update_water_level_ui(75.0f, 150.0f, 1500, 285, false, false, false);
+#endif
     setup_ui_events();
+    update_manual_leds();
 
-    // if (ui_LabelButton2) {
-    //     lv_label_set_text(ui_LabelButton2, "SCAN MB");
-    // }
-
-    // if (ui_TextArea1) {
-    //     lv_textarea_set_text(ui_TextArea1, "Waveshare ESP32-S3 Touch 4.3B\n");
-    //     lv_textarea_add_text(ui_TextArea1, "[LVGL] Version 9.5.0 Active\n");
-    //     lv_textarea_add_text(ui_TextArea1, "[GFX] LovyanGFX 1.2.33 Active\n");
-    //     lv_textarea_add_text(ui_TextArea1, "[DMA] True Double-Buffer (48L)\n");
-    //     lv_textarea_add_text(ui_TextArea1, rs485Ok ? "[OK] RS485 Modbus Ready\n" : "[ERR] RS485 Failed!\n");
-    //     lv_textarea_add_text(ui_TextArea1, canOk ? "[OK] CAN Bus (TWAI) Ready\n" : "[ERR] CAN Failed!\n");
-    //     lv_textarea_add_text(ui_TextArea1, "[UI] 60 FPS Render Pipeline\n");
-    //     lv_textarea_add_text(ui_TextArea1, "--------------------------------\n");
-    // }
     lvgl_port_unlock();
 
     // 8. สร้าง FreeRTOS Background Task สำหรับงานสื่อสาร แยกไปรันที่ CORE 0 โดยเฉพาะ
@@ -535,50 +998,22 @@ void setup() {
     );
 
     Serial.println("[SYSTEM] High-speed display pipeline active.");
+
+    DO0_ON;
+    delay(100);
+    DO1_ON;
+    delay(100);
+    DO0_OFF;
+    delay(100);
+    DO1_OFF;
 }
 
 void loop() {
-    // -----------------------------------------------------------------
-    // Core 1 Main Loop: อัปเดต GUI แสดงผลอย่างราบรื่น ไม่มีสะดุด
-    // -----------------------------------------------------------------
-
-    // // 1. ดึงข้อความจาก Log Queue มาแสดงผลบนหน้าจอ TextArea (จำกัดขนาดข้อความไม่ให้ layout บวมช้า)
-    // LogItem item;
-    // uint8_t processed = 0;
-    // while (logQueue && xQueueReceive(logQueue, &item, 0) == pdTRUE && processed < 3) {
-    //     processed++;
-    //     if (lvgl_port_lock(10)) {
-    //         // if (ui_TextArea1) {
-    //         //     const char* cur = lv_textarea_get_text(ui_TextArea1);
-    //         //     // ตัดข้อความเก่าออกเมื่อเกิน 1000 ตัวอักษร เพื่อรักษาความเร็วในการ Render
-    //         //     if (cur && strlen(cur) > 1000) {
-    //         //         lv_textarea_set_text(ui_TextArea1, "-- Log Trimmed --\n");
-    //         //     }
-    //         //     lv_textarea_add_text(ui_TextArea1, item.text);
-    //         // }
-    //         lvgl_port_unlock();
-    //     }
-    // }
-
-    // // 2. อัปเดตสีสถานะปุ่ม Digital Input (DI0 / DI1) เมื่อมีการเปลี่ยนแปลง
-    // if (di0_changed) {
-    //     di0_changed = false;
-    //     if (lvgl_port_lock(10)) {
-    //         // lv_obj_set_style_bg_color(ui_DI0, shared_di0 ? lv_color_hex(0x000000) : lv_color_hex(0x00A000), LV_PART_MAIN);
-    //         lvgl_port_unlock();
-    //     }
-    // }
-
-    // if (di1_changed) {
-    //     di1_changed = false;
-    //     if (lvgl_port_lock(10)) {
-    //         // lv_obj_set_style_bg_color(ui_DI1, shared_di1 ? lv_color_hex(0x000000) : lv_color_hex(0x00A000), LV_PART_MAIN);
-    //         lvgl_port_unlock();
-    //     }
-    // }
 
     // 3. อัปเดตเกจวัดระดับน้ำและกราฟแนวโน้มแบบ Real-Time จากข้อมูล Modbus
+    update_auto_pumps_from_pressure();
 #if WATER_LEVEL_SIMULATION
+    lastRs485Ok = true;
     update_water_level_simulation();
 #else
     if (reg_data_updated) {
@@ -591,12 +1026,23 @@ void loop() {
         if (level_pct < 0.0f)
             level_pct = 0.0f;
 
-        // if (lvgl_port_lock(10)) {
-        //     update_water_level_ui(level_pct, level_cm, shared_reg0, shared_reg1, level_pct < 42.0f, level_pct < 50.0f, level_pct > 78.0f);
-        //     lvgl_port_unlock();
-        // }
+        update_automatic_outputs(level_cm);
+        if (lvgl_port_lock(10)) {
+            const float volume_l = (level_pct / 100.0f) * waterSettings.tankCapacity;
+            const bool valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
+            const bool pump1On = (shared_rs485_outputs & (1u << 1)) != 0;
+            const bool pump2On = (shared_rs485_outputs & (1u << 2)) != 0;
+            update_water_level_ui(level_pct, level_cm, volume_l, (float)shared_reg1, valveOn, pump1On, pump2On);
+            update_manual_leds();
+            lvgl_port_unlock();
+        }
     }
 #endif
+
+    if (lvgl_port_lock(2)) {
+        update_manual_leds();
+        lvgl_port_unlock();
+    }
 
     delay(10);
 }

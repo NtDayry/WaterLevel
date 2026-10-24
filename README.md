@@ -246,3 +246,21 @@ build_flags =
     -DARDUINO_USB_CDC_ON_BOOT=1
 monitor_speed = 115200
 ```
+
+---
+
+## 🛠️ การตั้งค่า Waveshare โมดูล8-ch โมดูลรีเลย์อิเล็กทรอนิกส์ Modbus RTU (D)
+อ้างอิงเอกสารอย่างเป็นทางการ: [WaveShare Modbus RTU Relay (D) Documentation](https://www.waveshare.com/wiki/Modbus_RTU_Relay_(D))
+### คำสั่งตั้งค่า `Address`
+```ini
+Set the device address as 0x01: `00 06 40 00 00 01 5C 1B`
+Set the device address as 0x02: `00 06 40 00 00 02 1C 1A`
+Set the device address as 0x03: `00 06 40 00 00 03 DD DA`
+```
+
+### คำสั่งอ่าน `Address`
+```ini
+For example: [Address 2 device]
+Send:    00 03 40 00 00 01 90 1B
+Receive: 00 03 02 00 02 04 45       //Address: 0x02
+```

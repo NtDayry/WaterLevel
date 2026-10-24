@@ -1,0 +1,16 @@
+{
+  "codename": "NotoSans100",
+  "ttf_path": "/assets/NotoSansThai-Bold.ttf",
+  "bin_path": "/assets\\ui_font_NotoSans100.bin",
+  "c_path": "/assets\\ui_font_NotoSans100.c",
+  "cfg_path": "/assets\\ui_font_NotoSans100.fcfg",
+  "size": 100,
+  "bpp": 4,
+  "letters": 0,
+  "ranges": [
+    "0x20-0x7f"
+  ],
+  "symbols": "",
+  "customparams": "--no-compress --no-prefilter",
+  "uploaded": false
+}

@@ -5,8 +5,16 @@ ui_helpers.c
 images/ui_img_house_png.c
 images/ui_img_1329202414.c
 images/ui_img_1575836844.c
+images/ui_img_software_png.c
+fonts/ui_font_Chakra130.c
+fonts/ui_font_Chakra50.c
 fonts/ui_font_Font1.c
 fonts/ui_font_Font2.c
 fonts/ui_font_Font23.c
 fonts/ui_font_Font3.c
 fonts/ui_font_FontTH.c
+fonts/ui_font_Kanit50.c
+fonts/ui_font_NotoSans100.c
+fonts/ui_font_NotoSans60.c
+fonts/ui_font_sukhumvit25.c
+fonts/ui_font_sukhumvit30.c

@@ -40,13 +40,21 @@ extern lv_obj_t * ui____initial_actions0;
 LV_IMG_DECLARE(ui_img_house_png);    // assets/house.png
 LV_IMG_DECLARE(ui_img_1329202414);    // assets/settings (1).png
 LV_IMG_DECLARE(ui_img_1575836844);    // assets/microcontroller-technology.png
+LV_IMG_DECLARE(ui_img_software_png);    // assets/software.png
 
 // FONTS
+LV_FONT_DECLARE(ui_font_Chakra130);
+LV_FONT_DECLARE(ui_font_Chakra50);
 LV_FONT_DECLARE(ui_font_Font1);
 LV_FONT_DECLARE(ui_font_Font2);
 LV_FONT_DECLARE(ui_font_Font23);
 LV_FONT_DECLARE(ui_font_Font3);
 LV_FONT_DECLARE(ui_font_FontTH);
+LV_FONT_DECLARE(ui_font_Kanit50);
+LV_FONT_DECLARE(ui_font_NotoSans100);
+LV_FONT_DECLARE(ui_font_NotoSans60);
+LV_FONT_DECLARE(ui_font_sukhumvit25);
+LV_FONT_DECLARE(ui_font_sukhumvit30);
 
 // UI INIT
 void ui_init(void);
