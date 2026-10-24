@@ -89,6 +89,7 @@ struct WaterSettings {
     float valveOnCm = 84.0f;
     float tankCapacity = 2000.0f;
     uint32_t valvePeriodSec = 300;
+    uint32_t pumpDelaySec = 0;
     float alertMinCm = 40.0f;
     float alertMaxCm = 180.0f;
     uint32_t alertPeriodSec = 300;
@@ -149,6 +150,7 @@ static void load_water_settings() {
     waterSettings.valveOnCm = settingsStore.getFloat("voncm", waterSettings.valveOnCm);
     waterSettings.tankCapacity = settingsStore.getFloat("tankcap", waterSettings.tankCapacity);
     waterSettings.valvePeriodSec = settingsStore.getUInt("vperiod", waterSettings.valvePeriodSec);
+    waterSettings.pumpDelaySec = settingsStore.getUInt("pumpdelay", waterSettings.pumpDelaySec);
     waterSettings.alertMinCm = settingsStore.getFloat("amincm", waterSettings.alertMinCm);
     waterSettings.alertMaxCm = settingsStore.getFloat("amaxcm", waterSettings.alertMaxCm);
     waterSettings.alertPeriodSec = settingsStore.getUInt("aperiod", waterSettings.alertPeriodSec);
@@ -162,6 +164,7 @@ static void load_water_settings() {
     waterSettings.alertMinCm = constrain(waterSettings.alertMinCm, 0.0f, 200.0f);
     waterSettings.alertMaxCm = constrain(waterSettings.alertMaxCm, 0.0f, 200.0f);
     waterSettings.valvePeriodSec = constrain(waterSettings.valvePeriodSec, (uint32_t)1, (uint32_t)86400);
+    waterSettings.pumpDelaySec = constrain(waterSettings.pumpDelaySec, (uint32_t)0, (uint32_t)86400);
     waterSettings.alertPeriodSec = constrain(waterSettings.alertPeriodSec, (uint32_t)1, (uint32_t)86400);
     const float maxLevelCm = max(1.0f, waterSettings.tankCapacity);
     waterSettings.valveOnCm = min(waterSettings.valveOnCm, maxLevelCm);
@@ -176,6 +179,7 @@ static void save_water_settings() {
     settingsStore.putFloat("voncm", waterSettings.valveOnCm);
     settingsStore.putFloat("tankcap", waterSettings.tankCapacity);
     settingsStore.putUInt("vperiod", waterSettings.valvePeriodSec);
+    settingsStore.putUInt("pumpdelay", waterSettings.pumpDelaySec);
     settingsStore.putFloat("amincm", waterSettings.alertMinCm);
     settingsStore.putFloat("amaxcm", waterSettings.alertMaxCm);
     settingsStore.putUInt("aperiod", waterSettings.alertPeriodSec);
@@ -197,6 +201,7 @@ static void update_settings_ui() {
     set_textarea_number(ui_SetOnValve, waterSettings.valveOnCm, 1);
     set_textarea_number(ui_SetTankCapacity, waterSettings.tankCapacity, 1);
     set_textarea_number(ui_SetPeriodTimeContorl, (float)waterSettings.valvePeriodSec);
+    set_textarea_number(ui_SetPumpDelay, (float)waterSettings.pumpDelaySec);
     set_textarea_number(ui_SetMinAlert, waterSettings.alertMinCm, 1);
     set_textarea_number(ui_SetMaxAlert, waterSettings.alertMaxCm, 1);
     set_textarea_number(ui_SetPeriodTimeAlert, (float)waterSettings.alertPeriodSec);
@@ -231,6 +236,7 @@ static void save_settings_from_ui(lv_event_t *) {
     waterSettings.valveOnCm = boundedFloat(lv_textarea_get_text(ui_SetOnValve), waterSettings.valveOnCm, 0.0f, maxLevelCm);
     waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
     waterSettings.valvePeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 1, 86400);
+    waterSettings.pumpDelaySec = boundedUint(lv_textarea_get_text(ui_SetPumpDelay), waterSettings.pumpDelaySec, 0, 86400);
     waterSettings.alertMinCm = boundedFloat(lv_textarea_get_text(ui_SetMinAlert), waterSettings.alertMinCm, 0.0f, maxLevelCm);
     waterSettings.alertMaxCm = boundedFloat(lv_textarea_get_text(ui_SetMaxAlert), waterSettings.alertMaxCm, 0.0f, maxLevelCm);
     waterSettings.alertPeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeAlert), waterSettings.alertPeriodSec, 1, 86400);
@@ -591,15 +597,29 @@ static void set_rs485_output(uint8_t coil, bool on) {
 }
 
 static void update_auto_pumps_from_pressure() {
+    static uint32_t pressureSince = 0;
     const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
-    if (!autoMode)
+    if (!autoMode) {
+        pressureSince = 0;
         return;
+    }
+
+    if (!shared_pressure_switch) {
+        pressureSince = 0;
+        set_rs485_output(1, false);
+        set_rs485_output(2, false);
+        return;
+    }
+
+    if (pressureSince == 0)
+        pressureSince = millis();
+    const bool delayElapsed = millis() - pressureSince >= waterSettings.pumpDelaySec * 1000UL;
 
     // Pressure switch DI address 1 is the single source of truth for Auto
     // pump requests. The output shadow is updated immediately and the comm
     // task sends all eight coils in one 0x0F transaction.
-    set_rs485_output(1, shared_pressure_switch && waterSettings.autoPump1);
-    set_rs485_output(2, shared_pressure_switch && waterSettings.autoPump2);
+    set_rs485_output(1, delayElapsed && waterSettings.autoPump1);
+    set_rs485_output(2, delayElapsed && waterSettings.autoPump2);
 }
 
 static bool update_automatic_outputs(float levelCm) {
@@ -688,8 +708,8 @@ static void update_manual_leds() {
     set_monitor_alpha(ui_LocalDI1, shared_di1);
     set_monitor_alpha(ui_LocalDO0, localDo0On);
     set_monitor_alpha(ui_LocalDO1, localDo1On);
-    lv_obj_t *rs485Di[] = {ui_RS485DI0, ui_RS485DI1, ui_RS485DI2, ui_RS485DI3, ui_RS485DI4, ui_RS485DI5, ui_RS485DI6, ui_RS485DI7};
-    lv_obj_t *rs485Do[] = {ui_RS485DO0, ui_RS485DO1, ui_RS485DO2, ui_RS485DO3, ui_RS485DO4, ui_RS485DO5, ui_RS485DO6, ui_RS485DO7};
+    lv_obj_t *rs485Di[] = {ui_RS485DI1, ui_RS485DI2, ui_RS485DI3, ui_RS485DI4, ui_RS485DI5, ui_RS485DI6, ui_RS485DI7, ui_RS485DI8};
+    lv_obj_t *rs485Do[] = {ui_RS485CH1, ui_RS485CH2, ui_RS485CH3, ui_RS485CH4, ui_RS485CH5, ui_RS485CH6, ui_RS485CH7, ui_RS485CH8};
     for (uint8_t i = 0; i < 8; ++i) {
         set_monitor_alpha(rs485Di[i], rs485_io_ok && ((shared_rs485_inputs >> i) & 1));
         set_monitor_alpha(rs485Do[i], rs485_io_ok && ((shared_rs485_outputs >> i) & 1));
@@ -888,6 +908,24 @@ static void update_water_level_simulation() {
 #endif
 }
 
+static void setup_water_level_chart() {
+    if (!ui_LineChart)
+        return;
+
+    // The exported chart contains placeholder series. Hide them and create a
+    // runtime-owned 100-point series initialized to zero.
+    for (lv_chart_series_t *series = lv_chart_get_series_next(ui_LineChart, NULL);
+         series != NULL;
+         series = lv_chart_get_series_next(ui_LineChart, series)) {
+        lv_chart_hide_series(ui_LineChart, series, true);
+    }
+    lv_chart_set_point_count(ui_LineChart, 100);
+    waterLevelChartSeries = lv_chart_add_series(ui_LineChart, lv_color_hex(0x13C2D4), LV_CHART_AXIS_PRIMARY_Y);
+    if (waterLevelChartSeries)
+        lv_chart_set_all_values(ui_LineChart, waterLevelChartSeries, 0);
+    lv_chart_refresh(ui_LineChart);
+}
+
 void setup_ui_events() {
     lv_obj_add_event_cb(ui_HomeButton, select_chart, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SettingsButton, select_settings, LV_EVENT_CLICKED, NULL);
@@ -903,12 +941,14 @@ void setup_ui_events() {
     lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+    lv_obj_add_event_cb(ui_SetPumpDelay, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ui_SetPumpDelay, save_settings_from_ui, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
@@ -916,6 +956,7 @@ void setup_ui_events() {
     lv_obj_add_event_cb(ui_SetOnValve, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SetTankCapacity, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeContorl, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_SetPumpDelay, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SetMinAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SetMaxAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SetPeriodTimeAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
@@ -932,8 +973,8 @@ void setup_ui_events() {
         if (obj) lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(ui_LocalDO0, local_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)0);
     lv_obj_add_event_cb(ui_LocalDO1, local_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)1);
-    lv_obj_t *rs485Do[] = {ui_RS485DO0, ui_RS485DO1, ui_RS485DO2, ui_RS485DO3,
-                           ui_RS485DO4, ui_RS485DO5, ui_RS485DO6, ui_RS485DO7};
+    lv_obj_t *rs485Do[] = {ui_RS485CH1, ui_RS485CH2, ui_RS485CH3, ui_RS485CH4,
+                           ui_RS485CH5, ui_RS485CH6, ui_RS485CH7, ui_RS485CH8};
     for (uint8_t i = 0; i < 8; ++i) {
         if (rs485Do[i]) lv_obj_add_flag(rs485Do[i], LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(rs485Do[i], rs485_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
@@ -980,7 +1021,7 @@ void setup() {
     update_settings_ui();
     update_mode_ui();
 #if WATER_LEVEL_SIMULATION
-    setup_water_level_simulation();
+    setup_water_level_chart();
 #endif
     setup_ui_events();
     update_manual_leds();
@@ -999,12 +1040,12 @@ void setup() {
 
     Serial.println("[SYSTEM] High-speed display pipeline active.");
 
-    DO0_ON;
-    delay(100);
-    DO1_ON;
-    delay(100);
+    // DO0_ON;
+    // delay(100);
+    // DO1_ON;
+    // delay(100);
     DO0_OFF;
-    delay(100);
+    // delay(100);
     DO1_OFF;
 }
 
