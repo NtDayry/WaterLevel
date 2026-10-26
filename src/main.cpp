@@ -21,10 +21,12 @@
 #include "waveshare_sdcard.h"
 #include <Arduino.h>
 #include <ModbusMaster.h>
-#include <Preferences.h>
+#include "water_settings.h"
 #include <lv_conf.h>
 #include <lvgl.h>
 #include <math.h>
+#include <WiFi.h>
+#include <Preferences.h>
 
 // Real RS485 devices are connected on this installation.
 #ifndef WATER_LEVEL_SIMULATION
@@ -34,11 +36,12 @@
 // The level sensor is now part of the live system. Set to 0 only when testing
 // with the IO module alone, because a missing slave causes a Modbus timeout.
 #ifndef WATER_LEVEL_SENSOR_PRESENT
-#define WATER_LEVEL_SENSOR_PRESENT 0
+#define WATER_LEVEL_SENSOR_PRESENT 1
 #endif
 
 // Include Waveshare 4.3B Library (RS485, CAN, I2C, IO Expander)
 #include <WaveShare4_3B.h>
+#include "pcf85063.h"
 
 // =============================================================================
 // Modbus RTU Configuration
@@ -46,9 +49,9 @@
 volatile uint8_t MODBUS_SLAVE_ID = 2;        // Water-level sensor slave ID
 static const uint8_t RS485_IO_SLAVE_ID = 3;
 volatile uint32_t MODBUS_BAUD_RATE = 9600;   // Standard Baud Rate (เช่น 9600, 19200, 115200)
-volatile uint16_t MODBUS_START_REG = 0x0000; // Register เริ่มต้น
-volatile uint16_t MODBUS_REG_COUNT = 2;      // จำนวน Register ที่ต้องการอ่าน
-volatile uint32_t MODBUS_POLL_MS = 200;      // อ่านค่าทุก 200 ms
+volatile uint16_t MODBUS_START_REG = 0x0006; // Water level register address
+volatile uint16_t MODBUS_REG_COUNT = 1;      // Read level only
+volatile uint32_t MODBUS_POLL_MS = 1000;     // อ่านระดับน้ำทุก 1 วินาที
 
 ModbusMaster modbus;
 ModbusMaster rs485Io;
@@ -69,44 +72,571 @@ volatile bool shared_di1 = false;
 volatile bool di0_changed = false;
 volatile bool di1_changed = false;
 volatile uint16_t shared_reg0 = 1500;
-volatile uint16_t shared_reg1 = 285;
+// Water-meter data is not installed yet. Keep volume/flow at zero until a
+// dedicated meter input is added.
+volatile uint16_t shared_reg1 = 0;
 volatile bool reg_data_updated = false;
 volatile uint8_t shared_rs485_inputs = 0;
 volatile uint8_t shared_rs485_outputs = 0;
 volatile bool shared_pressure_switch = false;
 volatile bool rs485_io_ok = false;
+// The UI shadow is the source of truth for output commands. After a
+// reconnect, outputs are reset to a safe all-off state.
+volatile bool rs485_output_synced = false;
 volatile bool sensor_rs485_ok = false;
 
 // Water-level gauge created inside the SquareLine placeholder object.
 static lv_chart_series_t *waterLevelChartSeries = NULL;
+static lv_chart_series_t *flowRateChartSeries = NULL;
 static uint32_t lastSimulationUpdateMs = 0;
 static float simulatedLevelPct = 60.0f;
 
-// Persistent process settings. Values are percentages of the 0-100% tank
-// range; the UI text areas are intentionally kept as the source of truth for
-// editing, while these values are used by the control loop.
-struct WaterSettings {
-    float valveOnCm = 84.0f;
-    float tankCapacity = 2000.0f;
-    uint32_t valvePeriodSec = 300;
-    uint32_t pumpDelaySec = 0;
-    float alertMinCm = 40.0f;
-    float alertMaxCm = 180.0f;
-    uint32_t alertPeriodSec = 300;
-    bool autoMode = false;
-    bool autoPump1 = false;
-    bool autoPump2 = false;
-};
-
-static Preferences settingsStore;
-static WaterSettings waterSettings;
 static bool manualValveOverride = false;
 static uint32_t alertLowSince = 0;
 static uint32_t alertHighSince = 0;
 static bool alertOutputOn = false;
 static bool lastRs485Ok = false;
 
+static Pcf85063 rtc;
+static lv_obj_t *rtcClockLabel = nullptr;
+static lv_obj_t *rtcStatusLabel = nullptr;
+static lv_obj_t *rtcFields[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+static uint32_t lastRtcUpdateMs = 0;
+static lv_obj_t *wifiSsidInput = nullptr;
+static lv_obj_t *wifiPasswordInput = nullptr;
+static lv_obj_t *wifiIpInput = nullptr;
+static lv_obj_t *wifiMaskInput = nullptr;
+static lv_obj_t *wifiGatewayInput = nullptr;
+static lv_obj_t *wifiDnsInput = nullptr;
+static lv_obj_t *wifiFixIpSwitch = nullptr;
+static lv_obj_t *wifiStaticIpContainer = nullptr;
+static lv_obj_t *wifiStatusLabel = nullptr;
+static lv_obj_t *wifiScanList = nullptr;
+static char scannedSsids[20][33] = {};
+static bool wifiScanBusy = false;
+static bool wifiInitialized = false;
+static Preferences wifiPreferences;
+
 static void set_status_led(lv_obj_t *led, bool enabled, uint32_t on_color);
+static uint32_t boundedUint(const char *text, uint32_t fallback, uint32_t minValue, uint32_t maxValue);
+static void open_numeric_keyboard(lv_event_t *e);
+static void select_wifi_clock(lv_event_t *e);
+static bool is_wifi_input(lv_obj_t *obj);
+
+static bool is_rtc_input(lv_obj_t *obj) {
+    for (lv_obj_t *field : rtcFields)
+        if (obj == field) return true;
+    return false;
+}
+
+static void set_rtc_field(uint8_t index, uint16_t value) {
+    if (!rtcFields[index]) return;
+    char text[8];
+    snprintf(text, sizeof(text), index == 0 ? "%04u" : "%02u", value);
+    lv_textarea_set_text(rtcFields[index], text);
+}
+
+static void update_rtc_ui() {
+    if (!rtc.available()) {
+        if (rtcClockLabel) lv_label_set_text(rtcClockLabel, "RTC --:--:--");
+        if (rtcStatusLabel) lv_label_set_text(rtcStatusLabel, "PCF85063 not detected at I2C 0x51");
+        return;
+    }
+    RtcDateTime now;
+    if (!rtc.read(now)) {
+        if (rtcClockLabel) lv_label_set_text(rtcClockLabel, "RTC --:--:--");
+        if (rtcStatusLabel) lv_label_set_text(rtcStatusLabel, "RTC read error");
+        return;
+    }
+    char clockText[24];
+    snprintf(clockText, sizeof(clockText), "%02u/%02u/%04u %02u:%02u:%02u", now.day, now.month, now.year,
+             now.hour, now.minute, now.second);
+    if (rtcClockLabel) lv_label_set_text(rtcClockLabel, clockText);
+    if (rtcStatusLabel) lv_label_set_text(rtcStatusLabel, "RTC online  |  PCF85063 0x51");
+}
+
+static void read_rtc_to_fields(lv_event_t * = nullptr) {
+    if (!rtc.available()) return;
+    RtcDateTime now;
+    if (rtc.read(now)) {
+        set_rtc_field(0, now.year);
+        set_rtc_field(1, now.month);
+        set_rtc_field(2, now.day);
+        set_rtc_field(3, now.hour);
+        set_rtc_field(4, now.minute);
+        set_rtc_field(5, now.second);
+        if (rtcStatusLabel) {
+            lv_label_set_text(rtcStatusLabel, "RTC time loaded into fields");
+            lv_obj_set_style_text_color(rtcStatusLabel, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void save_rtc_from_ui(lv_event_t *) {
+    RtcDateTime value;
+    value.year = (uint16_t)boundedUint(lv_textarea_get_text(rtcFields[0]), 2026, 2000, 2099);
+    value.month = (uint8_t)boundedUint(lv_textarea_get_text(rtcFields[1]), 1, 1, 12);
+    value.day = (uint8_t)boundedUint(lv_textarea_get_text(rtcFields[2]), 1, 1, 31);
+    value.hour = (uint8_t)boundedUint(lv_textarea_get_text(rtcFields[3]), 0, 0, 23);
+    value.minute = (uint8_t)boundedUint(lv_textarea_get_text(rtcFields[4]), 0, 0, 59);
+    value.second = (uint8_t)boundedUint(lv_textarea_get_text(rtcFields[5]), 0, 0, 59);
+    if (rtc.write(value)) {
+        Serial.println("[RTC] Date/time updated");
+        update_rtc_ui();
+        if (rtcStatusLabel) {
+            lv_label_set_text(rtcStatusLabel, "Date/time updated successfully");
+            lv_obj_set_style_text_color(rtcStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    } else if (rtcStatusLabel) {
+        lv_label_set_text(rtcStatusLabel, "Unable to write RTC; check wiring");
+        lv_obj_set_style_text_color(rtcStatusLabel, lv_color_hex(0xEF4444), LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+static lv_obj_t *create_rtc_textarea(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t width) {
+    lv_obj_t *field = lv_textarea_create(parent);
+    lv_obj_set_size(field, width, 46);
+    lv_obj_set_pos(field, x, y);
+    lv_textarea_set_one_line(field, true);
+    lv_obj_set_style_radius(field, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(field, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(field, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(field, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(field, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_align(field, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(field, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(field, lv_color_hex(0xEEEEEE), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(field, lv_color_hex(0x101C31), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(field, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(field, lv_color_hex(0x2B446E), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(field, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_event_cb(field, open_numeric_keyboard, LV_EVENT_CLICKED, nullptr);
+    return field;
+}
+
+static void on_clock_header_clicked(lv_event_t *e) {
+    select_wifi_clock(e);
+}
+
+static void setup_rtc_ui() {
+    rtcClockLabel = ui_DateTime;
+    lv_obj_add_flag(rtcClockLabel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(rtcClockLabel, on_clock_header_clicked, LV_EVENT_CLICKED, nullptr);
+    update_rtc_ui();
+}
+
+static lv_obj_t *create_wifi_input(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t width,
+                                   bool password = false) {
+    lv_obj_t *input = lv_textarea_create(parent);
+    lv_obj_set_size(input, width, 46);
+    lv_obj_set_pos(input, x, y);
+    lv_textarea_set_one_line(input, true);
+    lv_textarea_set_password_mode(input, password);
+    lv_obj_set_style_radius(input, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(input, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(input, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(input, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(input, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(input, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(input, lv_color_hex(0xEEEEEE), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(input, lv_color_hex(0x101C31), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(input, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(input, lv_color_hex(0x2B446E), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(input, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_event_cb(input, open_numeric_keyboard, LV_EVENT_CLICKED, nullptr);
+    return input;
+}
+
+static void create_wifi_field_label(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, const char *text) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
+static bool is_wifi_input(lv_obj_t *obj) {
+    return obj == wifiSsidInput || obj == wifiPasswordInput || obj == wifiIpInput ||
+           obj == wifiMaskInput || obj == wifiGatewayInput || obj == wifiDnsInput;
+}
+
+static void update_wifi_status() {
+    if (!wifiStatusLabel) return;
+    if (WiFi.status() == WL_CONNECTED) {
+        char text[128];
+        snprintf(text, sizeof(text), "Connected: %s  |  IP: %s  |  RSSI: %d dBm", WiFi.SSID().c_str(),
+                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        lv_label_set_text(wifiStatusLabel, text);
+        lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+    } else {
+        lv_label_set_text(wifiStatusLabel, "Wi-Fi: Disconnected");
+        lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+static bool init_wifi_once() {
+    if (wifiInitialized)
+        return true;
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    wifiInitialized = true;
+    Serial.printf("[WiFi] initialized, free heap: %u bytes\n", ESP.getFreeHeap());
+    return true;
+}
+
+static void load_wifi_settings() {
+    wifiPreferences.begin("wifi", false);
+    lv_textarea_set_text(wifiSsidInput, wifiPreferences.getString("ssid", "").c_str());
+    lv_textarea_set_text(wifiPasswordInput, wifiPreferences.getString("pass", "").c_str());
+    lv_textarea_set_text(wifiIpInput, wifiPreferences.getString("ip", "192.168.1.50").c_str());
+    lv_textarea_set_text(wifiMaskInput, wifiPreferences.getString("mask", "255.255.255.0").c_str());
+    lv_textarea_set_text(wifiGatewayInput, wifiPreferences.getString("gw", "192.168.1.1").c_str());
+    lv_textarea_set_text(wifiDnsInput, wifiPreferences.getString("dns", "8.8.8.8").c_str());
+    const bool fixIp = wifiPreferences.getBool("fix_ip", !wifiPreferences.getBool("dhcp", true));
+    if (wifiFixIpSwitch) {
+        if (fixIp) lv_obj_add_state(wifiFixIpSwitch, LV_STATE_CHECKED);
+        else lv_obj_clear_state(wifiFixIpSwitch, LV_STATE_CHECKED);
+    }
+    if (wifiStaticIpContainer) {
+        if (fixIp) lv_obj_clear_flag(wifiStaticIpContainer, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(wifiStaticIpContainer, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static bool parse_ip_field(lv_obj_t *input, IPAddress &address) {
+    return input && address.fromString(lv_textarea_get_text(input));
+}
+
+static void save_wifi_settings(lv_event_t *) {
+    const bool fixIp = wifiFixIpSwitch && lv_obj_has_state(wifiFixIpSwitch, LV_STATE_CHECKED);
+    IPAddress address;
+    if (fixIp && (!parse_ip_field(wifiIpInput, address) || !parse_ip_field(wifiMaskInput, address) ||
+                  !parse_ip_field(wifiGatewayInput, address) || !parse_ip_field(wifiDnsInput, address))) {
+        lv_label_set_text(wifiStatusLabel, "Invalid static IP / Subnet / Gateway / DNS");
+        lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0xEF4444), LV_PART_MAIN | LV_STATE_DEFAULT);
+        return;
+    }
+    wifiPreferences.putString("ssid", lv_textarea_get_text(wifiSsidInput));
+    wifiPreferences.putString("pass", lv_textarea_get_text(wifiPasswordInput));
+    wifiPreferences.putString("ip", lv_textarea_get_text(wifiIpInput));
+    wifiPreferences.putString("mask", lv_textarea_get_text(wifiMaskInput));
+    wifiPreferences.putString("gw", lv_textarea_get_text(wifiGatewayInput));
+    wifiPreferences.putString("dns", lv_textarea_get_text(wifiDnsInput));
+    wifiPreferences.putBool("fix_ip", fixIp);
+    wifiPreferences.putBool("dhcp", !fixIp);
+
+    init_wifi_once();
+    if (fixIp) {
+        IPAddress ip, mask, gateway, dns;
+        parse_ip_field(wifiIpInput, ip);
+        parse_ip_field(wifiMaskInput, mask);
+        parse_ip_field(wifiGatewayInput, gateway);
+        parse_ip_field(wifiDnsInput, dns);
+        WiFi.config(ip, gateway, mask, dns);
+    } else {
+        WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+    }
+    WiFi.begin(lv_textarea_get_text(wifiSsidInput), lv_textarea_get_text(wifiPasswordInput));
+    lv_label_set_text(wifiStatusLabel, "Connecting to Wi-Fi...");
+    lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
+static void on_wifi_ssid_selected(lv_event_t *e) {
+    const char *ssid = (const char *)lv_event_get_user_data(e);
+    if (ssid && wifiSsidInput) {
+        lv_textarea_set_text(wifiSsidInput, ssid);
+        if (wifiStatusLabel) {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "Selected SSID: %s", ssid);
+            lv_label_set_text(wifiStatusLabel, msg);
+            lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void scan_wifi_networks(lv_event_t *) {
+    if (wifiScanBusy) return;
+    wifiScanBusy = true;
+    if (wifiScanList) {
+        lv_obj_clean(wifiScanList);
+        lv_list_add_text(wifiScanList, "Scanning nearby Wi-Fi networks...");
+    }
+    if (wifiStatusLabel) {
+        lv_label_set_text(wifiStatusLabel, "Scanning Wi-Fi...");
+        lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+    init_wifi_once();
+    WiFi.scanDelete();
+    const int count = WiFi.scanNetworks(false, true);
+    if (wifiScanList) lv_obj_clean(wifiScanList);
+
+    if (count <= 0) {
+        if (wifiScanList) lv_list_add_text(wifiScanList, "No Wi-Fi networks found");
+        if (wifiStatusLabel) {
+            lv_label_set_text(wifiStatusLabel, "No Wi-Fi networks found");
+            lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    } else {
+        const int shown = min(count, 20);
+        int validCount = 0;
+        for (int i = 0; i < shown; ++i) {
+            String rawSsid = WiFi.SSID(i);
+            if (rawSsid.length() == 0) continue;
+            strncpy(scannedSsids[validCount], rawSsid.c_str(), sizeof(scannedSsids[validCount]) - 1);
+            scannedSsids[validCount][sizeof(scannedSsids[validCount]) - 1] = '\0';
+
+            char itemText[80];
+            snprintf(itemText, sizeof(itemText), "%s %s  (%d dBm)  %s",
+                     LV_SYMBOL_WIFI, scannedSsids[validCount], WiFi.RSSI(i),
+                     WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "[Open]" : "[Lock]");
+
+            lv_obj_t *btn = lv_list_add_button(wifiScanList, nullptr, itemText);
+            lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_color(btn, lv_color_hex(0xEEEEEE), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x131E33), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(btn, 220, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_top(btn, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_bottom(btn, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_left(btn, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_right(btn, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_radius(btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_add_event_cb(btn, on_wifi_ssid_selected, LV_EVENT_CLICKED, scannedSsids[validCount]);
+            validCount++;
+        }
+        if (wifiStatusLabel) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Found %d networks. Tap network to select SSID.", validCount);
+            lv_label_set_text(wifiStatusLabel, buf);
+            lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+    WiFi.scanDelete();
+    wifiScanBusy = false;
+}
+
+static void wifi_fix_ip_changed(lv_event_t *) {
+    const bool fixIp = wifiFixIpSwitch && lv_obj_has_state(wifiFixIpSwitch, LV_STATE_CHECKED);
+    if (wifiStaticIpContainer) {
+        if (fixIp) lv_obj_clear_flag(wifiStaticIpContainer, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(wifiStaticIpContainer, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void setup_wifi_clock_ui() {
+    lv_obj_set_style_pad_all(ui_PanelWiFiAndClock, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(ui_PanelWiFiAndClock, 30, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_row(ui_PanelWiFiAndClock, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_flex_flow(ui_PanelWiFiAndClock, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ui_PanelWiFiAndClock, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(ui_PanelWiFiAndClock, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(ui_PanelWiFiAndClock, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ui_PanelWiFiAndClock, LV_SCROLLBAR_MODE_AUTO);
+
+    auto create_card = [](lv_obj_t *parent, lv_coord_t h) -> lv_obj_t * {
+        lv_obj_t *card = lv_obj_create(parent);
+        lv_obj_set_size(card, 465, h);
+        lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(card, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0D1527), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(card, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1E293B), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(card, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_all(card, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        return card;
+    };
+
+    // ==========================================
+    // 1. Wi-Fi Configuration Card
+    // ==========================================
+    lv_obj_t *wifiCard = create_card(ui_PanelWiFiAndClock, 324);
+
+    lv_obj_t *wifiTitle = lv_label_create(wifiCard);
+    lv_label_set_text(wifiTitle, "WI-FI SETTINGS");
+    lv_obj_set_pos(wifiTitle, 15, 10);
+    lv_obj_set_style_text_color(wifiTitle, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(wifiTitle, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    create_wifi_field_label(wifiCard, 15, 34, "SSID");
+    wifiSsidInput = create_wifi_input(wifiCard, 15, 50, 210);
+
+    create_wifi_field_label(wifiCard, 240, 34, "PASSWORD");
+    wifiPasswordInput = create_wifi_input(wifiCard, 240, 50, 210, true);
+
+    wifiFixIpSwitch = lv_switch_create(wifiCard);
+    lv_obj_set_pos(wifiFixIpSwitch, 15, 108);
+    lv_obj_set_size(wifiFixIpSwitch, 42, 22);
+    lv_obj_add_event_cb(wifiFixIpSwitch, wifi_fix_ip_changed, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_t *fixIpLabel = lv_label_create(wifiCard);
+    lv_label_set_text(fixIpLabel, "FIX IP");
+    lv_obj_set_pos(fixIpLabel, 64, 111);
+    lv_obj_set_style_text_color(fixIpLabel, lv_color_hex(0xCBD5E1), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(fixIpLabel, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_t *scanButton = lv_button_create(wifiCard);
+    lv_obj_set_size(scanButton, 105, 32);
+    lv_obj_set_pos(scanButton, 225, 104);
+    lv_obj_set_style_radius(scanButton, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(scanButton, lv_color_hex(0x1E293B), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(scanButton, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(scanButton, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_t *scanText = lv_label_create(scanButton);
+    lv_label_set_text(scanText, "SCAN WIFI");
+    lv_obj_set_style_text_color(scanText, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(scanText, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_center(scanText);
+    lv_obj_add_event_cb(scanButton, scan_wifi_networks, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *saveButton = lv_button_create(wifiCard);
+    lv_obj_set_size(saveButton, 110, 32);
+    lv_obj_set_pos(saveButton, 340, 104);
+    lv_obj_set_style_radius(saveButton, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(saveButton, lv_color_hex(0x0284C7), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(saveButton, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(saveButton, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_t *saveText = lv_label_create(saveButton);
+    lv_label_set_text(saveText, "CONNECT");
+    lv_obj_set_style_text_color(saveText, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(saveText, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_center(saveText);
+    lv_obj_add_event_cb(saveButton, save_wifi_settings, LV_EVENT_CLICKED, nullptr);
+
+    create_wifi_field_label(wifiCard, 15, 144, "NEARBY NETWORKS (TAP TO SELECT SSID)");
+
+    wifiScanList = lv_list_create(wifiCard);
+    lv_obj_set_size(wifiScanList, 435, 100);
+    lv_obj_set_pos(wifiScanList, 15, 162);
+    lv_obj_set_style_radius(wifiScanList, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(wifiScanList, lv_color_hex(0x0A101D), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(wifiScanList, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(wifiScanList, lv_color_hex(0x1E293B), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(wifiScanList, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_all(wifiScanList, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_scrollbar_mode(wifiScanList, LV_SCROLLBAR_MODE_AUTO);
+    lv_list_add_text(wifiScanList, "Press [SCAN WIFI] to discover and select networks");
+
+    wifiStatusLabel = lv_label_create(wifiCard);
+    lv_label_set_text(wifiStatusLabel, "Wi-Fi: Disconnected");
+    lv_obj_set_pos(wifiStatusLabel, 15, 292);
+    lv_obj_set_width(wifiStatusLabel, 435);
+    lv_label_set_long_mode(wifiStatusLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(wifiStatusLabel, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    // ==========================================
+    // 2. Static IP Settings (Shown only when FIX IP is toggled)
+    // ==========================================
+    wifiStaticIpContainer = create_card(ui_PanelWiFiAndClock, 176);
+    lv_obj_add_flag(wifiStaticIpContainer, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *staticTitle = lv_label_create(wifiStaticIpContainer);
+    lv_label_set_text(staticTitle, "FIX IP CONFIGURATION");
+    lv_obj_set_pos(staticTitle, 15, 10);
+    lv_obj_set_style_text_color(staticTitle, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(staticTitle, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    create_wifi_field_label(wifiStaticIpContainer, 15, 32, "IP ADDRESS");
+    wifiIpInput = create_wifi_input(wifiStaticIpContainer, 15, 48, 210);
+
+    create_wifi_field_label(wifiStaticIpContainer, 240, 32, "SUBNET MASK");
+    wifiMaskInput = create_wifi_input(wifiStaticIpContainer, 240, 48, 210);
+
+    create_wifi_field_label(wifiStaticIpContainer, 15, 104, "GATEWAY");
+    wifiGatewayInput = create_wifi_input(wifiStaticIpContainer, 15, 120, 210);
+
+    create_wifi_field_label(wifiStaticIpContainer, 240, 104, "DNS SERVER");
+    wifiDnsInput = create_wifi_input(wifiStaticIpContainer, 240, 120, 210);
+
+    // ==========================================
+    // 3. RTC Clock Settings Card (Directly below Wi-Fi)
+    // ==========================================
+    lv_obj_t *rtcCard = create_card(ui_PanelWiFiAndClock, 205);
+
+    lv_obj_t *rtcCardTitle = lv_label_create(rtcCard);
+    lv_label_set_text(rtcCardTitle, "RTC CLOCK SETTINGS");
+    lv_obj_set_pos(rtcCardTitle, 15, 10);
+    lv_obj_set_style_text_color(rtcCardTitle, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(rtcCardTitle, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    const char *rtcLabels[] = {"YEAR", "MONTH", "DAY", "HOUR", "MIN", "SEC"};
+    const lv_coord_t rtcXs[] = {15, 108, 173, 247, 312, 377};
+    const lv_coord_t rtcWidths[] = {82, 56, 56, 56, 56, 56};
+    for (uint8_t i = 0; i < 6; ++i) {
+        lv_obj_t *lbl = lv_label_create(rtcCard);
+        lv_label_set_text(lbl, rtcLabels[i]);
+        lv_obj_set_pos(lbl, rtcXs[i], 32);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+        rtcFields[i] = create_rtc_textarea(rtcCard, rtcXs[i], 48, rtcWidths[i]);
+    }
+
+    lv_obj_t *readRtcBtn = lv_button_create(rtcCard);
+    lv_obj_set_size(readRtcBtn, 120, 34);
+    lv_obj_set_pos(readRtcBtn, 15, 108);
+    lv_obj_set_style_radius(readRtcBtn, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(readRtcBtn, lv_color_hex(0x1E293B), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(readRtcBtn, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(readRtcBtn, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_t *readText = lv_label_create(readRtcBtn);
+    lv_label_set_text(readText, "READ RTC");
+    lv_obj_set_style_text_color(readText, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(readText, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_center(readText);
+    lv_obj_add_event_cb(readRtcBtn, read_rtc_to_fields, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *saveRtcBtn = lv_button_create(rtcCard);
+    lv_obj_set_size(saveRtcBtn, 140, 34);
+    lv_obj_set_pos(saveRtcBtn, 145, 108);
+    lv_obj_set_style_radius(saveRtcBtn, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(saveRtcBtn, lv_color_hex(0x0284C7), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(saveRtcBtn, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(saveRtcBtn, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_t *saveRtcText = lv_label_create(saveRtcBtn);
+    lv_label_set_text(saveRtcText, "SAVE RTC TIME");
+    lv_obj_set_style_text_color(saveRtcText, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(saveRtcText, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_center(saveRtcText);
+    lv_obj_add_event_cb(saveRtcBtn, save_rtc_from_ui, LV_EVENT_CLICKED, nullptr);
+
+    rtcStatusLabel = lv_label_create(rtcCard);
+    lv_label_set_text(rtcStatusLabel, "");
+    lv_obj_set_pos(rtcStatusLabel, 15, 160);
+    lv_obj_set_width(rtcStatusLabel, 435);
+    lv_label_set_long_mode(rtcStatusLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(rtcStatusLabel, lv_color_hex(0x94A3B8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(rtcStatusLabel, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    read_rtc_to_fields(nullptr);
+    load_wifi_settings();
+    update_wifi_status();
+}
+
+static uint8_t compile_month(const char *text) {
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    for (uint8_t i = 0; i < 12; ++i)
+        if (strncmp(text, months[i], 3) == 0) return (uint8_t)(i + 1);
+    return 1;
+}
+
+static RtcDateTime build_compile_datetime() {
+    RtcDateTime value;
+    char month[4] = {};
+    int day = 1;
+    int year = 2026;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    sscanf(__DATE__, "%3s %d %d", month, &day, &year);
+    sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
+    value.year = (uint16_t)year;
+    value.month = compile_month(month);
+    value.day = (uint8_t)day;
+    value.hour = (uint8_t)hour;
+    value.minute = (uint8_t)minute;
+    value.second = (uint8_t)second;
+    return value;
+}
 
 struct LogItem {
     char text[128];
@@ -145,50 +675,6 @@ static uint32_t boundedUint(const char *text, uint32_t fallback, uint32_t minVal
     return (uint32_t)(value < (long)minValue ? minValue : (value > (long)maxValue ? maxValue : value));
 }
 
-static void load_water_settings() {
-    settingsStore.begin("watercfg", false);
-    waterSettings.valveOnCm = settingsStore.getFloat("voncm", waterSettings.valveOnCm);
-    waterSettings.tankCapacity = settingsStore.getFloat("tankcap", waterSettings.tankCapacity);
-    waterSettings.valvePeriodSec = settingsStore.getUInt("vperiod", waterSettings.valvePeriodSec);
-    waterSettings.pumpDelaySec = settingsStore.getUInt("pumpdelay", waterSettings.pumpDelaySec);
-    waterSettings.alertMinCm = settingsStore.getFloat("amincm", waterSettings.alertMinCm);
-    waterSettings.alertMaxCm = settingsStore.getFloat("amaxcm", waterSettings.alertMaxCm);
-    waterSettings.alertPeriodSec = settingsStore.getUInt("aperiod", waterSettings.alertPeriodSec);
-    waterSettings.autoMode = settingsStore.getBool("automode", waterSettings.autoMode);
-    waterSettings.autoPump1 = settingsStore.getBool("apump1", waterSettings.autoPump1);
-    waterSettings.autoPump2 = settingsStore.getBool("apump2", waterSettings.autoPump2);
-    settingsStore.end();
-
-    waterSettings.valveOnCm = constrain(waterSettings.valveOnCm, 0.0f, 200.0f);
-    waterSettings.tankCapacity = constrain(waterSettings.tankCapacity, 0.1f, 1000000.0f);
-    waterSettings.alertMinCm = constrain(waterSettings.alertMinCm, 0.0f, 200.0f);
-    waterSettings.alertMaxCm = constrain(waterSettings.alertMaxCm, 0.0f, 200.0f);
-    waterSettings.valvePeriodSec = constrain(waterSettings.valvePeriodSec, (uint32_t)1, (uint32_t)86400);
-    waterSettings.pumpDelaySec = constrain(waterSettings.pumpDelaySec, (uint32_t)0, (uint32_t)86400);
-    waterSettings.alertPeriodSec = constrain(waterSettings.alertPeriodSec, (uint32_t)1, (uint32_t)86400);
-    const float maxLevelCm = max(1.0f, waterSettings.tankCapacity);
-    waterSettings.valveOnCm = min(waterSettings.valveOnCm, maxLevelCm);
-    waterSettings.alertMinCm = min(waterSettings.alertMinCm, maxLevelCm);
-    waterSettings.alertMaxCm = min(waterSettings.alertMaxCm, maxLevelCm);
-    if (waterSettings.alertMinCm >= waterSettings.alertMaxCm)
-        waterSettings.alertMaxCm = min(200.0f, waterSettings.alertMinCm + 1.0f);
-}
-
-static void save_water_settings() {
-    settingsStore.begin("watercfg", false);
-    settingsStore.putFloat("voncm", waterSettings.valveOnCm);
-    settingsStore.putFloat("tankcap", waterSettings.tankCapacity);
-    settingsStore.putUInt("vperiod", waterSettings.valvePeriodSec);
-    settingsStore.putUInt("pumpdelay", waterSettings.pumpDelaySec);
-    settingsStore.putFloat("amincm", waterSettings.alertMinCm);
-    settingsStore.putFloat("amaxcm", waterSettings.alertMaxCm);
-    settingsStore.putUInt("aperiod", waterSettings.alertPeriodSec);
-    settingsStore.putBool("automode", waterSettings.autoMode);
-    settingsStore.putBool("apump1", waterSettings.autoPump1);
-    settingsStore.putBool("apump2", waterSettings.autoPump2);
-    settingsStore.end();
-}
-
 static void set_textarea_number(lv_obj_t *textarea, float value, uint8_t decimals = 0) {
     if (!textarea)
         return;
@@ -200,7 +686,7 @@ static void set_textarea_number(lv_obj_t *textarea, float value, uint8_t decimal
 static void update_settings_ui() {
     set_textarea_number(ui_SetOnValve, waterSettings.valveOnCm, 1);
     set_textarea_number(ui_SetTankCapacity, waterSettings.tankCapacity, 1);
-    set_textarea_number(ui_SetPeriodTimeContorl, (float)waterSettings.valvePeriodSec);
+    set_textarea_number(ui_SetPeriodTimeContorl, waterSettings.valvePeriodSec, 1);
     set_textarea_number(ui_SetPumpDelay, (float)waterSettings.pumpDelaySec);
     set_textarea_number(ui_SetMinAlert, waterSettings.alertMinCm, 1);
     set_textarea_number(ui_SetMaxAlert, waterSettings.alertMaxCm, 1);
@@ -232,17 +718,18 @@ static void update_mode_ui() {
 }
 
 static void save_settings_from_ui(lv_event_t *) {
+    waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
+    // Tank capacity is the source of truth for every level limit.
     const float maxLevelCm = configuredLevelMaxCm();
     waterSettings.valveOnCm = boundedFloat(lv_textarea_get_text(ui_SetOnValve), waterSettings.valveOnCm, 0.0f, maxLevelCm);
-    waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
-    waterSettings.valvePeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 1, 86400);
+    waterSettings.valvePeriodSec = boundedFloat(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 0.1f, 86400.0f);
     waterSettings.pumpDelaySec = boundedUint(lv_textarea_get_text(ui_SetPumpDelay), waterSettings.pumpDelaySec, 0, 86400);
     waterSettings.alertMinCm = boundedFloat(lv_textarea_get_text(ui_SetMinAlert), waterSettings.alertMinCm, 0.0f, maxLevelCm);
     waterSettings.alertMaxCm = boundedFloat(lv_textarea_get_text(ui_SetMaxAlert), waterSettings.alertMaxCm, 0.0f, maxLevelCm);
     waterSettings.alertPeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeAlert), waterSettings.alertPeriodSec, 1, 86400);
 
     if (waterSettings.alertMinCm >= waterSettings.alertMaxCm)
-        waterSettings.alertMaxCm = min(200.0f, waterSettings.alertMinCm + 1.0f);
+        waterSettings.alertMaxCm = min(maxLevelCm, waterSettings.alertMinCm + 1.0f);
     update_settings_ui();
     save_water_settings();
 }
@@ -273,8 +760,15 @@ static void open_numeric_keyboard(lv_event_t *e) {
 
     lv_textarea_set_text(ui_KeyboardDisplay, lv_textarea_get_text(activeNumericInput));
     lv_keyboard_set_textarea(ui_Keyboard, ui_KeyboardDisplay);
-    lv_keyboard_set_mode(ui_Keyboard, LV_KEYBOARD_MODE_NUMBER);
+    lv_keyboard_set_mode(ui_Keyboard, is_wifi_input(activeNumericInput) &&
+                                        activeNumericInput != wifiIpInput && activeNumericInput != wifiMaskInput &&
+                                        activeNumericInput != wifiGatewayInput && activeNumericInput != wifiDnsInput
+                                    ? LV_KEYBOARD_MODE_TEXT_LOWER
+                                    : LV_KEYBOARD_MODE_NUMBER);
     lv_obj_clear_flag(ui_ContainerKeyboard, LV_OBJ_FLAG_HIDDEN);
+    // The RTC dialog is created after the generated keyboard, so bring the
+    // keyboard to the front when editing one of its fields.
+    lv_obj_move_foreground(ui_ContainerKeyboard);
     lv_obj_add_state(ui_KeyboardDisplay, LV_STATE_FOCUSED);
     lv_textarea_set_cursor_pos(ui_KeyboardDisplay, LV_TEXTAREA_CURSOR_LAST);
 }
@@ -286,7 +780,8 @@ static void close_numeric_keyboard(lv_event_t *e) {
     const lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY) {
         lv_textarea_set_text(activeNumericInput, lv_textarea_get_text(ui_KeyboardDisplay));
-        save_settings_from_ui(nullptr);
+        if (!is_rtc_input(activeNumericInput) && !is_wifi_input(activeNumericInput))
+            save_settings_from_ui(nullptr);
     }
     lv_obj_add_flag(ui_ContainerKeyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_state(ui_KeyboardDisplay, LV_STATE_FOCUSED);
@@ -376,23 +871,33 @@ void doModbusPoll() {
 }
 
 static void pollRs485Io() {
+    static bool wasConnected = false;
     rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
     WS43B.rs485.clearRxBuffer();
     const uint8_t inputResult = rs485Io.readDiscreteInputs(0, 8); // 1x: addresses 0..7
     if (inputResult != rs485Io.ku8MBSuccess) {
         rs485_io_ok = false;
+        wasConnected = false;
+        rs485_output_synced = false;
         return;
     }
     // Slave 3 is online as soon as the required 8-channel input read works.
-    // Some IO modules do not implement function 0x01 (read coils), even
-    // though they support function 0x0F for writing all eight outputs.
-    rs485_io_ok = true;
+    // This module supports input reads and function 0x0F writes, but its
+    // read-coils response is not reliable. Do not use function 0x01 as a
+    // reconnect test because it creates a false disconnect/reconnect loop.
     shared_rs485_inputs = (uint8_t)(rs485Io.getResponseBuffer(0) & 0xFF);
     shared_pressure_switch = (shared_rs485_inputs & (1u << 1)) != 0; // DI address 1
 
-    // This IO module is verified to support 0x0F write-multiple-coils, but
-    // does not need 0x01 read-coils for operation. Keep the output shadow from
-    // the successful 0x0F response to avoid a timeout on every IO poll.
+    // Outputs are controlled only by the local shadow updated from the UI.
+    // On the first connection or after reconnect, resend the latest UI state
+    // once; never read or import an indeterminate coil state from the module.
+    if (!wasConnected) {
+        rs485_output_synced = true;
+        pendingIoMask = 0xFF;
+    }
+
+    rs485_io_ok = true;
+    wasConnected = true;
 }
 
 void doModbusScan() {
@@ -450,8 +955,8 @@ void commTask(void *param) {
     uint8_t local_last_di1 = 0xFF;
 
     while (true) {
-        // 1. จัดการคำขอเขียน Coil (จาก UI สวิตช์ DO0/DO1)
-        if (pendingIoMask != 0) {
+        // 1. ส่งสถานะ output เมื่อมีการเปลี่ยนแปลง หรือครั้งแรกหลังเชื่อมต่อ
+        if (rs485_output_synced && pendingIoMask != 0) {
             pendingIoMask = 0;
             rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
             // The IO module requires all eight outputs in one transaction.
@@ -460,8 +965,11 @@ void commTask(void *param) {
             const uint8_t result = rs485Io.writeMultipleCoils(0, 8); // 0x0F, coils 0..7
             if (result == rs485Io.ku8MBSuccess)
                 rs485_io_ok = true;
-            else
+            else {
+                // Retry after the DI poll confirms the link is available.
+                pendingIoMask = 0xFF;
                 rs485_io_ok = false;
+            }
         }
 
         // 2. จัดการคำขอสแกนหา Slave ID (จากปุ่ม SCAN MB)
@@ -473,14 +981,14 @@ void commTask(void *param) {
 
         // 3. รอบอ่านค่า Modbus อัตโนมัติตามรอบเวลา
 #if !WATER_LEVEL_SIMULATION && WATER_LEVEL_SENSOR_PRESENT
-        const uint32_t sensorPollInterval = sensor_rs485_ok ? MODBUS_POLL_MS : 5000UL;
+        const uint32_t sensorPollInterval = MODBUS_POLL_MS;
         if (millis() - lastPollTime >= sensorPollInterval) {
             lastPollTime = millis();
             doModbusPoll();
         }
 #endif
         static unsigned long lastIoPollTime = 0;
-        if (millis() - lastIoPollTime >= 50) {
+        if (millis() - lastIoPollTime >= 500) {
             lastIoPollTime = millis();
             pollRs485Io();
         }
@@ -724,6 +1232,13 @@ static void manual_output_event(lv_event_t *e) {
     const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
     if (autoMode)
         return;
+    // The UI order is Pump1, Pump2, Valve, while the Modbus coils are
+    // Valve=0, Pump1=1, Pump2=2.
+    const uint8_t coil = output == 0 ? 1 : (output == 1 ? 2 : 0);
+    set_rs485_output(coil, state);
+    if (output == 2)
+        manualValveOverride = state;
+
     if (output == 2) {
         manualValveOverride = true;
         set_rs485_output(0, state);
@@ -758,6 +1273,7 @@ static void select_panel(lv_obj_t *panel) {
     lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelManual, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelMonitor, LV_OBJ_FLAG_HIDDEN);
+    if (ui_PanelWiFiAndClock) lv_obj_add_flag(ui_PanelWiFiAndClock, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -770,6 +1286,12 @@ static void select_settings(lv_event_t *) {
     update_settings_ui();
     select_panel(ui_PanelSettings);
     if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "Settings");
+}
+
+static void select_wifi_clock(lv_event_t *) {
+    select_panel(ui_PanelWiFiAndClock);
+    update_wifi_status();
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "WiFi & Clock");
 }
 
 static void select_manual(lv_event_t *) {
@@ -835,7 +1357,11 @@ static void update_water_level_ui(float level_pct, float level_cm, float volume_
     }
 
     if (waterLevelChartSeries && ui_LineChart) {
-        lv_chart_set_next_value(ui_LineChart, waterLevelChartSeries, (int32_t)(level_pct + 0.5f));
+        // Data1 follows the WaterTankLevel percentage exactly.
+        lv_chart_set_next_value(ui_LineChart, waterLevelChartSeries, (int32_t)(clamped_pct + 0.5f));
+        // Data2 follows LabelFlowRate. Missing flow data is represented by 0.
+        if (flowRateChartSeries)
+            lv_chart_set_next_value(ui_LineChart, flowRateChartSeries, (int32_t)(flow_rate >= 0.0f ? flow_rate : 0.0f));
         lv_chart_refresh(ui_LineChart);
     }
 
@@ -890,12 +1416,9 @@ static void update_water_level_simulation() {
         simulatedLevelPct = 95.0f;
 
     const float level_pct = simulatedLevelPct;
-    const float level_cm = level_pct * 2.0f;                        // 200 cm tank
-    const float volume_l = (level_pct / 100.0f) * waterSettings.tankCapacity;
-    float flow = 100.0f + level_pct * 1.8f + (float)random(-25, 26);
-    if (flow < 0)
-        flow = 0;
-    const float flow_rate = flow;
+    const float level_cm = (level_pct / 100.0f) * configuredLevelMaxCm();
+    const float volume_l = 0.0f; // Water meter is not installed yet.
+    const float flow_rate = 0.0f;
     const bool valve_on = update_automatic_outputs(level_cm);
     const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
     const bool pump1_on = autoMode && waterSettings.autoPump1 && shared_pressure_switch;
@@ -913,16 +1436,19 @@ static void setup_water_level_chart() {
         return;
 
     // The exported chart contains placeholder series. Hide them and create a
-    // runtime-owned 100-point series initialized to zero.
+    // runtime-owned 50-point chart series for WaterTank level and flow.
     for (lv_chart_series_t *series = lv_chart_get_series_next(ui_LineChart, NULL);
          series != NULL;
          series = lv_chart_get_series_next(ui_LineChart, series)) {
         lv_chart_hide_series(ui_LineChart, series, true);
     }
-    lv_chart_set_point_count(ui_LineChart, 100);
+    lv_chart_set_point_count(ui_LineChart, 50);
     waterLevelChartSeries = lv_chart_add_series(ui_LineChart, lv_color_hex(0x13C2D4), LV_CHART_AXIS_PRIMARY_Y);
+    flowRateChartSeries = lv_chart_add_series(ui_LineChart, lv_color_hex(0xF59E0B), LV_CHART_AXIS_PRIMARY_Y);
     if (waterLevelChartSeries)
         lv_chart_set_all_values(ui_LineChart, waterLevelChartSeries, 0);
+    if (flowRateChartSeries)
+        lv_chart_set_all_values(ui_LineChart, flowRateChartSeries, 0);
     lv_chart_refresh(ui_LineChart);
 }
 
@@ -931,12 +1457,14 @@ void setup_ui_events() {
     lv_obj_add_event_cb(ui_SettingsButton, select_settings, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_ManualButton, select_manual, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_MonitorButton, select_monitor, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_WiFiAndClock, select_wifi_clock, LV_EVENT_CLICKED, NULL);
     // SquareLine marks the child images as clickable, so a touch on an icon
     // may target the image instead of bubbling to its button parent.
     lv_obj_add_event_cb(ui_Image1, select_chart, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image2, select_settings, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image3, select_manual, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image4, select_monitor, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ui_Image6, select_wifi_clock, LV_EVENT_CLICKED, NULL);
 
     lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
@@ -994,6 +1522,11 @@ void setup() {
     Serial.println(" Waveshare ESP32-S3-Touch-LCD-4.3B: High-Speed System");
     Serial.println("========================================================");
 
+    // Initialize Wi-Fi while the internal heap is still available. LVGL uses
+    // DMA-capable internal buffers, so starting Wi-Fi after the UI is built
+    // can fail with ESP_ERR_NO_MEM (257).
+    init_wifi_once();
+
     // 1. สร้าง Queue สำหรับส่งข้อความ Log ข้าม Core แบบ Thread-safe
     logQueue = xQueueCreate(25, sizeof(LogItem));
 
@@ -1006,6 +1539,22 @@ void setup() {
 
     // 4. เริ่มต้นพอร์ต RS485 (GPIO 44 TX, GPIO 43 RX)
     bool rs485Ok = WS43B.rs485.begin(MODBUS_BAUD_RATE, SERIAL_8N1, WS43B_RS485_RX_PIN, WS43B_RS485_TX_PIN);
+
+    // PCF85063 shares the board I2C pins with the touch/IO hardware.
+    Wire.begin(WS43B_I2C_SDA_PIN, WS43B_I2C_SCL_PIN, WS43B_I2C_DEFAULT_FREQ);
+    const bool rtcOk = rtc.begin(Wire, WS43B_I2C_ADDR_PCF85063);
+    Serial.println(rtcOk ? "[RTC] PCF85063 detected at 0x51" : "[RTC] PCF85063 not detected");
+    if (rtcOk) {
+        RtcDateTime rtcValue;
+        // A new PCF85063 can contain zero/invalid calendar fields. Seed it
+        // once so the UI has a valid value; the user can then correct it from
+        // SET CLOCK.
+        if (!rtc.read(rtcValue)) {
+            rtcValue = build_compile_datetime();
+            Serial.println(rtc.write(rtcValue) ? "[RTC] Invalid value; seeded from compile time"
+                                                : "[RTC] Unable to seed invalid value");
+        }
+    }
 
     // 5. เริ่มต้น ModbusMaster โดยผูกเข้ากับ Serial1
     modbus.begin(MODBUS_SLAVE_ID, Serial1);
@@ -1020,10 +1569,10 @@ void setup() {
     load_water_settings();
     update_settings_ui();
     update_mode_ui();
-#if WATER_LEVEL_SIMULATION
     setup_water_level_chart();
-#endif
     setup_ui_events();
+    setup_rtc_ui();
+    setup_wifi_clock_ui();
     update_manual_leds();
 
     lvgl_port_unlock();
@@ -1040,12 +1589,7 @@ void setup() {
 
     Serial.println("[SYSTEM] High-speed display pipeline active.");
 
-    // DO0_ON;
-    // delay(100);
-    // DO1_ON;
-    // delay(100);
     DO0_OFF;
-    // delay(100);
     DO1_OFF;
 }
 
@@ -1061,7 +1605,9 @@ void loop() {
         reg_data_updated = false;
         // แปลงค่า Raw Modbus (สมมุติหน่วย mm เต็มถัง 2000 mm = 200.0 cm)
         float level_cm = (float)shared_reg0 / 10.0f;
-        float level_pct = (level_cm / 200.0f) * 100.0f;
+        // Sensor value is in mm; convert to cm, then normalize against the
+        // configured tank capacity instead of a hard-coded 200 cm tank.
+        float level_pct = (level_cm / configuredLevelMaxCm()) * 100.0f;
         if (level_pct > 100.0f)
             level_pct = 100.0f;
         if (level_pct < 0.0f)
@@ -1069,11 +1615,11 @@ void loop() {
 
         update_automatic_outputs(level_cm);
         if (lvgl_port_lock(10)) {
-            const float volume_l = (level_pct / 100.0f) * waterSettings.tankCapacity;
+            const float volume_l = 0.0f; // Water meter is not installed yet.
             const bool valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
             const bool pump1On = (shared_rs485_outputs & (1u << 1)) != 0;
             const bool pump2On = (shared_rs485_outputs & (1u << 2)) != 0;
-            update_water_level_ui(level_pct, level_cm, volume_l, (float)shared_reg1, valveOn, pump1On, pump2On);
+            update_water_level_ui(level_pct, level_cm, volume_l, 0.0f, valveOn, pump1On, pump2On);
             update_manual_leds();
             lvgl_port_unlock();
         }
@@ -1082,6 +1628,11 @@ void loop() {
 
     if (lvgl_port_lock(2)) {
         update_manual_leds();
+        if (millis() - lastRtcUpdateMs >= 1000) {
+            lastRtcUpdateMs = millis();
+            update_rtc_ui();
+            update_wifi_status();
+        }
         lvgl_port_unlock();
     }
 

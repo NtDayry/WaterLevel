@@ -2,10 +2,12 @@ SET(SOURCES screens/ui_Screen1.c
     ui.c
     components/ui_comp_hook.c
     ui_helpers.c
+    images/ui_img_menu_open_png.c
     images/ui_img_house_png.c
-    images/ui_img_1329202414.c
+    images/ui_img_settings_png.c
     images/ui_img_1575836844.c
     images/ui_img_software_png.c
+    images/ui_img_1757177593.c
     fonts/ui_font_Chakra130.c
     fonts/ui_font_Chakra50.c
     fonts/ui_font_Font1.c

@@ -25,7 +25,7 @@ LGFX gfx;
 #define LVGL_PORT_TASK_MIN_DELAY_MS (1)
 // 48 lines = 800 * 48 * 2 = 76,800 bytes per buffer.
 // Fits completely within ESP32-S3 internal DMA SRAM for true Double-Buffering!
-#define LVGL_BUF_LINES (96)
+#define LVGL_BUF_LINES (48)
 #define LVGL_BUF_SIZE (800 * LVGL_BUF_LINES)
 
 static lv_display_t *disp_handle = NULL;
