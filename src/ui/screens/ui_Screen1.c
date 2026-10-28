@@ -303,13 +303,13 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_bg_opa(ui_ManualButton, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Image3 = lv_image_create(ui_ManualButton);
-    lv_image_set_src(ui_Image3, &ui_img_1575836844);
+    lv_image_set_src(ui_Image3, &ui_img_guide_png);
     lv_obj_set_width(ui_Image3, 50);
     lv_obj_set_height(ui_Image3, 50);
     lv_obj_set_align(ui_Image3, LV_ALIGN_CENTER);
     lv_obj_add_flag(ui_Image3, LV_OBJ_FLAG_CLICKABLE);     /// Flags
     lv_obj_remove_flag(ui_Image3, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_image_set_scale(ui_Image3, 20);
+    lv_image_set_scale(ui_Image3, 65);
 
     ui_MonitorButton = lv_button_create(ui_ContainerMenu);
     lv_obj_set_width(ui_MonitorButton, 48);
@@ -324,7 +324,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_bg_opa(ui_MonitorButton, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Image4 = lv_image_create(ui_MonitorButton);
-    lv_image_set_src(ui_Image4, &ui_img_software_png);
+    lv_image_set_src(ui_Image4, &ui_img_testing_png);
     lv_obj_set_width(ui_Image4, 50);
     lv_obj_set_height(ui_Image4, 50);
     lv_obj_set_align(ui_Image4, LV_ALIGN_CENTER);

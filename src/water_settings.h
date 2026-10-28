@@ -14,6 +14,9 @@ struct WaterSettings {
     bool autoMode = false;
     bool autoPump1 = false;
     bool autoPump2 = false;
+    bool manualPump1 = false;
+    bool manualPump2 = false;
+    bool manualValve = false;
 };
 
 extern WaterSettings waterSettings;

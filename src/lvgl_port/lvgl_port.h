@@ -57,18 +57,40 @@ static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     uint32_t h = area->y2 - area->y1 + 1;
 
     gfx.pushImageDMA(area->x1, area->y1, w, h, (const lgfx::rgb565_t *)px_map);
+    gfx.waitDMA();
     lv_display_flush_ready(disp);
 }
 
 // ------------------ TOUCH ------------------
+extern void on_touch_wakeup();
+extern volatile bool isBacklightOn;
+
+static bool _touchWakeupConsuming = false;  // Block touch until finger is lifted
+
 static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     uint16_t x, y;
 
     if (gfx.getTouch(&x, &y)) {
+        // Screen was OFF → turn it on and swallow this entire touch gesture
+        if (!isBacklightOn) {
+            on_touch_wakeup();
+            _touchWakeupConsuming = true;   // Block until finger lifted
+        }
+
+        if (_touchWakeupConsuming) {
+            // Consume: report released so LVGL sees nothing
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+
+        // Normal touch — update activity timer and pass to LVGL
+        on_touch_wakeup();
         data->state = LV_INDEV_STATE_PRESSED;
         data->point.x = x;
         data->point.y = y;
     } else {
+        // Finger lifted — clear the wakeup-consume guard
+        _touchWakeupConsuming = false;
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }

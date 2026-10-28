@@ -20,6 +20,9 @@ void load_water_settings() {
     waterSettings.autoMode = store.getBool("automode", waterSettings.autoMode);
     waterSettings.autoPump1 = store.getBool("apump1", waterSettings.autoPump1);
     waterSettings.autoPump2 = store.getBool("apump2", waterSettings.autoPump2);
+    waterSettings.manualPump1 = store.getBool("mpump1", waterSettings.manualPump1);
+    waterSettings.manualPump2 = store.getBool("mpump2", waterSettings.manualPump2);
+    waterSettings.manualValve = store.getBool("mvalve", waterSettings.manualValve);
     store.end();
 
     waterSettings.tankCapacity = constrain(waterSettings.tankCapacity, 0.1f, 1000000.0f);
@@ -47,5 +50,8 @@ void save_water_settings() {
     store.putBool("automode", waterSettings.autoMode);
     store.putBool("apump1", waterSettings.autoPump1);
     store.putBool("apump2", waterSettings.autoPump2);
+    store.putBool("mpump1", waterSettings.manualPump1);
+    store.putBool("mpump2", waterSettings.manualPump2);
+    store.putBool("mvalve", waterSettings.manualValve);
     store.end();
 }
