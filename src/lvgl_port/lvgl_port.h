@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include <LovyanGFX.hpp>
 #include <lvgl.h>
+#include "waveshare_ch422g.h"
 
 #if defined(LGFX_LCD2_3)
 #include "../gfx/LGFX_ESP32S3_RGB_MakerfabsParallelTFTwithTouch2_3.h"
@@ -33,6 +34,7 @@ static lv_indev_t *indev_handle = NULL;
 static uint8_t *buf1 = NULL;
 static uint8_t *buf2 = NULL;
 static SemaphoreHandle_t lvgl_mux = NULL;
+static TaskHandle_t lvglTaskHandle = NULL;
 
 // ------------------ TICK ------------------
 static uint32_t my_tick_get(void) {
@@ -49,6 +51,18 @@ inline bool lvgl_port_lock(int timeout_ms) {
 inline bool lvgl_port_unlock() {
     assert(lvgl_mux && "lvgl_port_init must be called first");
     return xSemaphoreGiveRecursive(lvgl_mux) == pdTRUE;
+}
+
+inline void lvgl_port_suspend() {
+    if (lvglTaskHandle != NULL) {
+        vTaskSuspend(lvglTaskHandle);
+    }
+}
+
+inline void lvgl_port_resume() {
+    if (lvglTaskHandle != NULL) {
+        vTaskResume(lvglTaskHandle);
+    }
 }
 
 // ------------------ FLUSH ------------------
@@ -69,8 +83,14 @@ static bool _touchWakeupConsuming = false;  // Block touch until finger is lifte
 
 static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     uint16_t x, y;
+    bool touched = false;
 
-    if (gfx.getTouch(&x, &y)) {
+    if (i2c_bus_lock(10)) {
+        touched = gfx.getTouch(&x, &y);
+        i2c_bus_unlock();
+    }
+
+    if (touched) {
         // Screen was OFF → turn it on and swallow this entire touch gesture
         if (!isBacklightOn) {
             on_touch_wakeup();
@@ -151,5 +171,5 @@ inline void lvgl_port_init() {
     lvgl_mux = xSemaphoreCreateRecursiveMutex();
 
     // Run LVGL task on Core 1 with high priority
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 10240, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 10240, NULL, 3, &lvglTaskHandle, 1);
 }

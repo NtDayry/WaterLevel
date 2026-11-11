@@ -1,11 +1,12 @@
 #pragma once
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <LovyanGFX.hpp>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
-//-----------  MARCO ----------------------------
-//OUTPUT and Backlight Control
+//-----------  MACRO ----------------------------
+// OUTPUT and Backlight Control
 #define DO0_ON \
   do { DO_Write(DO0, LOW); } while (0)
 #define DO0_OFF \
@@ -20,21 +21,20 @@
 #define BL_OFF \
   do { EX_Write(LCD_BL, LOW); } while (0)
 
-
 //----------------------------------------------
-/*CH422G Pin Map for Waveshare ESP32-S3 Touch 5"
+/* CH422G Pin Map for Waveshare ESP32-S3 Touch 4.3B
 EXIO0 - DI0
 EXIO1 - TP_RST
-EXI02 - LCD_BL
-EXI03 - LCD_RESET
+EXIO2 - LCD_BL (DISP)
+EXIO3 - LCD_RESET
 EXIO4 - SD_CS
 EXIO5 - DI1
-EXIO6 - NOT USE
-EXIO7 - NOT USE
-OC0 - DO0
-OC1 - DO1 
-OC2 - NOT USE
-OC3 - NOT USE
+EXIO6 - NOT USED
+EXIO7 - NOT USED
+OC0   - DO0
+OC1   - DO1 
+OC2   - NOT USED
+OC3   - NOT USED
 */
 
 // Waveshare ESP32-S3-Touch-LCD-4.3B Hardware Pin Definitions
@@ -43,7 +43,6 @@ OC3 - NOT USE
 #define RS485_TX 44 // SP3485 DI (TX)
 #define RS485_RX 43 // SP3485 RO (RX)
 
-
 #define DI0 0      // INPUT common ground OPEN-HIGH, CLOSE-LOW
 #define TP_RST 1   // OUTPUT touch reset
 #define LCD_BL 2   // OUTPUT backlight
@@ -51,11 +50,12 @@ OC3 - NOT USE
 #define SD_CS 4    // OUTPUT sd select
 #define DI1 5      // INPUT common ground OPEN-HIGH, CLOSE-LOW
 
-#define DO0 0  //digital output -|LOAD|+ 5-36V|GND (LOW ON, HIGH OFF)
+#define DO0 0  // digital output -|LOAD|+ 5-36V|GND (LOW ON, HIGH OFF)
 #define DO1 1
 
 #define CH422G_CONFIG_WRITE_ENABLE 0b00000001
 #define CH422G_CONFIG_READ_ENABLE  0b00000010
+
 // CH422G I2C device addresses
 #define CH422G_ADDR_WR_SET 0x24 
 #define CH422G_ADDR_WR_IO  0x38
@@ -64,6 +64,7 @@ OC3 - NOT USE
 
 #define I2C_PORT 0
 #define I2C_FREQ 400000
+
 // I2C Pin define
 #define I2C_MASTER_NUM 0
 #define I2C_MASTER_SDA_IO 8
@@ -74,6 +75,9 @@ extern uint8_t EXIO_state;
 extern uint8_t DI0_shadow_state;
 extern uint8_t DI1_shadow_state;
 
+// Thread-safe I2C Mutex
+bool i2c_bus_lock(int timeout_ms = 100);
+void i2c_bus_unlock();
 
 void initCH422G();
 uint8_t EX_Read_All();

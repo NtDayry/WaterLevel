@@ -1,7 +1,4 @@
 #include "waveshare_ch422g.h"
-#include <Wire.h>
-
-#define I2C_FREQ 400000
 
 uint8_t EXIO_state = 0b11111111;
 uint8_t DO_state   = 0b00000000;
@@ -9,25 +6,48 @@ uint8_t DO_state   = 0b00000000;
 uint8_t DI0_shadow_state = 0;
 uint8_t DI1_shadow_state = 0;
 
-#define CH422G_CONFIG_WRITE_ENABLE 0b00000001
-#define CH422G_CONFIG_READ_ENABLE  0b00000010
+static SemaphoreHandle_t i2cMux = NULL;
+
+bool i2c_bus_lock(int timeout_ms) {
+    if (i2cMux == NULL) {
+        i2cMux = xSemaphoreCreateRecursiveMutex();
+    }
+    if (i2cMux == NULL) return false;
+    TickType_t t = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTakeRecursive(i2cMux, t) == pdTRUE;
+}
+
+void i2c_bus_unlock() {
+    if (i2cMux != NULL) {
+        xSemaphoreGiveRecursive(i2cMux);
+    }
+}
 
 //-------------------------------------------------------
 // INIT
 void initCH422G() {
-    // set WRITE mode
-    uint8_t config = CH422G_CONFIG_WRITE_ENABLE;
-    lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &config, 1, I2C_FREQ);
-    delay(10);
+    if (i2cMux == NULL) {
+        i2cMux = xSemaphoreCreateRecursiveMutex();
+    }
 
-    // set EXIO state
-    lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_IO, &EXIO_state, 1, I2C_FREQ);
-    delay(10);
+    if (i2c_bus_lock(200)) {
+        // Set WRITE mode (IO output enable = 1)
+        uint8_t config = CH422G_CONFIG_WRITE_ENABLE;
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &config, 1, I2C_FREQ);
+        delay(10);
 
-    // OC OFF
-    uint8_t oc_state = 0x0F;
-    lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_OC, &oc_state, 1, I2C_FREQ);
-    delay(10);
+        // Set EXIO state (Backlight ON, resets released, DIN0/DIN1 pull-ups enabled)
+        EXIO_state = 0b11111111;
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_IO, &EXIO_state, 1, I2C_FREQ);
+        delay(10);
+
+        // OC OFF
+        uint8_t oc_state = 0x0F;
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_OC, &oc_state, 1, I2C_FREQ);
+        delay(10);
+
+        i2c_bus_unlock();
+    }
 }
 
 //-------------------------------------------------------
@@ -38,7 +58,10 @@ void DO_Write(uint8_t pin, bool state) {
     else
         DO_state &= ~(1 << pin);
 
-    lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_OC, &DO_state, 1, I2C_FREQ);
+    if (i2c_bus_lock(50)) {
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_OC, &DO_state, 1, I2C_FREQ);
+        i2c_bus_unlock();
+    }
 }
 
 //-------------------------------------------------------
@@ -48,27 +71,22 @@ uint8_t DO_Read(uint8_t pin) {
 }
 
 //-------------------------------------------------------
-// READ ALL EXIO (แนะนำให้ใช้ตัวนี้)
+// READ ALL EXIO
+// Reads physical IO states directly from register 0x26.
+// NEVER toggle register 0x24 to READ mode, because that disables IO_OE (bit 0)
+// and tri-states all pins, which turns off LCD backlight and resets ST7701!
 uint8_t EX_Read_All() {
-
     uint8_t inputs = 0;
 
-    // 1. set READ mode
-    uint8_t read_config = CH422G_CONFIG_READ_ENABLE;
-    if (!lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &read_config, 1, I2C_FREQ)) {
-        Serial.println("EX Read: Config failed");
-        return 0;
+    if (i2c_bus_lock(20)) {
+        if (!lgfx::i2c::transactionRead(I2C_PORT, CH422G_ADDR_RD_IO, &inputs, 1, I2C_FREQ)) {
+            // If read failed, keep last known state rather than zeroing
+            inputs = EXIO_state;
+        }
+        i2c_bus_unlock();
+    } else {
+        inputs = EXIO_state;
     }
-
-    // 2. read data
-    if (!lgfx::i2c::transactionRead(I2C_PORT, CH422G_ADDR_RD_IO, &inputs, 1, I2C_FREQ)) {
-        Serial.println("EX Read: Read failed");
-        return 0;
-    }
-
-    // 3. restore WRITE mode
-    uint8_t write_config = CH422G_CONFIG_WRITE_ENABLE;
-    lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &write_config, 1, I2C_FREQ);
 
     return inputs;
 }
@@ -83,22 +101,22 @@ bool EX_Read(uint8_t pin) {
 //-------------------------------------------------------
 // EX WRITE
 void EX_Write(uint8_t pin, bool state) {
-
-    // set WRITE mode
-    uint8_t write_config = CH422G_CONFIG_WRITE_ENABLE;
-    if (!lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &write_config, 1, I2C_FREQ)) {
-        Serial.println("EX Write: Config failed");
-        return;
-    }
-
     // update shadow
     if (state)
         EXIO_state |= (1 << pin);
     else
         EXIO_state &= ~(1 << pin);
 
-    // write IO
-    if (!lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_IO, &EXIO_state, 1, I2C_FREQ)) {
-        Serial.println("EX Write: Data failed");
+    // Safety guard: TP_RST (pin 1) and LCD_RST (pin 3) must always remain HIGH (not in reset)
+    EXIO_state |= (1 << TP_RST) | (1 << LCD_RST);
+
+    if (i2c_bus_lock(50)) {
+        // Ensure WRITE mode is active
+        uint8_t write_config = CH422G_CONFIG_WRITE_ENABLE;
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_SET, &write_config, 1, I2C_FREQ);
+
+        // Write IO states (bit 2 = LCD_BL)
+        lgfx::i2c::transactionWrite(I2C_PORT, CH422G_ADDR_WR_IO, &EXIO_state, 1, I2C_FREQ);
+        i2c_bus_unlock();
     }
 }

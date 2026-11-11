@@ -14,14 +14,13 @@ struct RtcDateTime {
 
 class Pcf85063 {
 public:
+    bool begin(uint8_t address = 0x51);
     bool begin(TwoWire &wire, uint8_t address = 0x51);
     bool available() const { return _available; }
     bool read(RtcDateTime &dateTime);
     bool write(const RtcDateTime &dateTime);
 
 private:
-    TwoWire *_wire = nullptr;
     uint8_t _address = 0x51;
     bool _available = false;
 };
-

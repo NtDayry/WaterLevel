@@ -17,6 +17,7 @@
 
 #include "lvgl_port/lvgl_port.h"
 #include "ui/ui.h"
+#include "ui_ota.h"
 #include "waveshare_ch422g.h"
 #include "waveshare_sdcard.h"
 #include <Arduino.h>
@@ -26,6 +27,7 @@
 #include <lvgl.h>
 #include <math.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -71,11 +73,69 @@ volatile float shared_volume_l = 0.0f;
 volatile uint8_t shared_rs485_inputs = 0;
 volatile uint8_t shared_rs485_outputs = 0;
 volatile bool shared_pressure_switch = false;
+volatile bool shared_pump1_overload = false;
+volatile bool shared_pump2_overload = false;
 volatile bool rs485_io_ok = false;
 // The UI shadow is the source of truth for output commands. After a
 // reconnect, outputs are reset to a safe all-off state.
 volatile bool rs485_output_synced = false;
 volatile bool sensor_rs485_ok = false;
+
+// Pressure Transmitter (Slave ID 6, Reg 0, 0-6.00 bar)
+volatile float shared_pressure_bar = 0.0f;
+volatile bool pressure_sensor_ok = false;
+
+// Inverter 1 (OMRON SYSDRIVE 3G3JZ, Slave ID 4 - Pump 1)
+volatile float shared_pump1_freq = 0.0f;      // Hz
+volatile float shared_pump1_current = 0.0f;   // A
+volatile uint16_t shared_pump1_status = 0;
+volatile bool shared_pump1_running = false;
+volatile bool shared_pump1_alarm = false;
+volatile bool pump1_modbus_ok = false;
+
+// Inverter 2 (OMRON SYSDRIVE 3G3JZ, Slave ID 5 - Pump 2)
+volatile float shared_pump2_freq = 0.0f;      // Hz
+volatile float shared_pump2_current = 0.0f;   // A
+volatile uint16_t shared_pump2_status = 0;
+volatile bool shared_pump2_running = false;
+volatile bool shared_pump2_alarm = false;
+volatile bool pump2_modbus_ok = false;
+
+// Inverter PID control target frequency calculated on ESP32
+volatile float shared_pid_target_freq = 0.0f;
+volatile bool shared_is_sleeping = false;
+
+// RS485 input & output coil assignments. Keep the hardware mapping in one place so
+// the code does not depend on hard-coded bit positions throughout the UI and
+// control logic.
+
+// RS485 input coil assignments (mapped to CH422G IO pins)
+static constexpr uint8_t rs485_di1_io_pin = 0;
+static constexpr uint8_t rs485_di2_io_pin = 1;
+static constexpr uint8_t rs485_di3_io_pin = 2;
+static constexpr uint8_t rs485_di4_io_pin = 3;
+static constexpr uint8_t rs485_di5_io_pin = 4;
+static constexpr uint8_t rs485_di6_io_pin = 5;
+static constexpr uint8_t rs485_di7_io_pin = 6;
+static constexpr uint8_t rs485_di8_io_pin = 7;
+// RS485 output coil assignments (mapped to CH422G IO pins)
+static constexpr uint8_t rs485_ch1_io_pin = 0;
+static constexpr uint8_t rs485_ch2_io_pin = 1;
+static constexpr uint8_t rs485_ch3_io_pin = 2;
+static constexpr uint8_t rs485_ch4_io_pin = 3;
+static constexpr uint8_t rs485_ch5_io_pin = 4;
+static constexpr uint8_t rs485_ch6_io_pin = 5;
+static constexpr uint8_t rs485_ch7_io_pin = 6;
+static constexpr uint8_t rs485_ch8_io_pin = 7;
+
+// RS485 input/output mapping for the water pump control system
+static constexpr uint8_t pressure_switch_io_pin = rs485_di1_io_pin;
+static constexpr uint8_t pump1_overload_io_pin = rs485_di2_io_pin;
+static constexpr uint8_t pump2_overload_io_pin = rs485_di3_io_pin;
+static constexpr uint8_t pump1_io_pin = rs485_ch1_io_pin;
+static constexpr uint8_t pump2_io_pin = rs485_ch2_io_pin;
+static constexpr uint8_t valve_io_pin = rs485_ch3_io_pin;
+static constexpr uint8_t alarm_io_pin = rs485_ch4_io_pin;
 
 // Water-level gauge created inside the SquareLine placeholder object.
 static lv_chart_series_t *waterLevelChartSeries = NULL;
@@ -90,7 +150,9 @@ static bool alertOutputOn = false;
 static bool lastRs485Ok = false;
 
 static float configuredLevelMaxCm();
+static void set_output_state(uint8_t output, bool on);
 static void set_rs485_output(uint8_t coil, bool on);
+static void update_auto_pumps_from_pressure(float levelCm = -1.0f);
 
 static Pcf85063 rtc;
 static lv_obj_t *rtcClockLabel = nullptr;
@@ -127,6 +189,7 @@ static lv_obj_t *mqttStatusLabel = nullptr;
 static bool mqttEnabled = true;
 static uint32_t lastMqttPublishMs = 0;
 static uint32_t lastMqttReconnectMs = 0;
+static uint32_t mqttPublishIntervalMs = 1000; // 1 second
 
 // Power & System Settings (Auto Backlight & Auto Restart)
 static Preferences sysPreferences;
@@ -137,6 +200,7 @@ volatile uint32_t autoRestartMin = 1440;
 volatile bool isBacklightOn = true;
 volatile uint32_t lastUserActivityMs = 0;
 uint32_t bootTimeMs = 0;
+volatile uint32_t autoRestartStartMs = 0;
 
 static lv_obj_t *autoBacklightSwitch = nullptr;
 static lv_obj_t *autoBacklightInput = nullptr;
@@ -194,10 +258,19 @@ static void wifi_enable_toggle(lv_event_t *) {
 static void brightness_slider_event(lv_event_t *) { /* slider removed */ }
 
 static void save_system_settings_from_ui(lv_event_t *e = nullptr);
+static void auto_backlight_toggle(lv_event_t *e = nullptr);
+static void auto_restart_toggle(lv_event_t *e = nullptr);
 static void load_system_settings();
 static void update_system_status_label();
+static void update_settings_ui();
+static void update_mode_ui();
+static void update_manual_leds(bool force = false);
+static void publish_mqtt_data();
+static void publish_mqtt_settings();
+static void publish_mqtt_configs();
 
 static void set_status_led(lv_obj_t *led, bool enabled, uint32_t on_color);
+static void set_pump_led(lv_obj_t *led, bool running, bool alarm);
 static uint32_t boundedUint(const char *text, uint32_t fallback, uint32_t minValue, uint32_t maxValue);
 static void open_numeric_keyboard(lv_event_t *e);
 static void select_wifi_clock(lv_event_t *e);
@@ -320,11 +393,55 @@ static void load_system_settings() {
     }
 
     lastUserActivityMs = millis();
+    autoRestartStartMs = millis();
     bootTimeMs = millis();
     update_system_status_label();
 }
 
+static void auto_backlight_toggle(lv_event_t *) {
+    const bool enabled = autoBacklightSwitch && lv_obj_has_state(autoBacklightSwitch, LV_STATE_CHECKED);
+    autoBacklightEnabled = enabled;
+    if (enabled) {
+        lastUserActivityMs = millis();
+        if (!isBacklightOn) {
+            BL_ON;
+            isBacklightOn = true;
+        }
+        Serial.printf("[SYS] Auto Backlight turned ON -> timer started (%lu min)\n", autoBacklightMin);
+    } else {
+        Serial.println("[SYS] Auto Backlight turned OFF");
+    }
+
+    sysPreferences.begin("syscfg", false);
+    sysPreferences.putBool("autoBL", autoBacklightEnabled);
+    sysPreferences.end();
+
+    update_system_status_label();
+}
+
+static void auto_restart_toggle(lv_event_t *) {
+    const bool enabled = autoRestartSwitch && lv_obj_has_state(autoRestartSwitch, LV_STATE_CHECKED);
+    autoRestartEnabled = enabled;
+    if (enabled) {
+        autoRestartStartMs = millis();
+        Serial.printf("[SYS] Auto Restart turned ON -> timer started (%lu min)\n", autoRestartMin);
+    } else {
+        Serial.println("[SYS] Auto Restart turned OFF");
+    }
+
+    sysPreferences.begin("syscfg", false);
+    sysPreferences.putBool("autoRS", autoRestartEnabled);
+    sysPreferences.end();
+
+    update_system_status_label();
+}
+
 static void save_system_settings_from_ui(lv_event_t *e) {
+    const bool prevAutoBL = autoBacklightEnabled;
+    const bool prevAutoRS = autoRestartEnabled;
+    const uint32_t prevBLMin = autoBacklightMin;
+    const uint32_t prevRSMin = autoRestartMin;
+
     autoBacklightEnabled = autoBacklightSwitch && lv_obj_has_state(autoBacklightSwitch, LV_STATE_CHECKED);
     autoRestartEnabled = autoRestartSwitch && lv_obj_has_state(autoRestartSwitch, LV_STATE_CHECKED);
     if (autoBacklightInput)
@@ -351,11 +468,28 @@ static void save_system_settings_from_ui(lv_event_t *e) {
     sysPreferences.putUInt("rsMin", autoRestartMin);
     sysPreferences.end();
 
-    lastUserActivityMs = millis();
+    // Start / reset counting when time is edited or when turned ON, or on explicit save button click
+    if ((autoBacklightEnabled && !prevAutoBL) || (autoBacklightMin != prevBLMin) || e != nullptr) {
+        lastUserActivityMs = millis();
+        if (autoBacklightEnabled && !isBacklightOn) {
+            BL_ON;
+            isBacklightOn = true;
+        }
+        Serial.printf("[SYS] Auto Backlight timer reset (%lu min)\n", autoBacklightMin);
+    }
+
+    if ((autoRestartEnabled && !prevAutoRS) || (autoRestartMin != prevRSMin) || e != nullptr) {
+        autoRestartStartMs = millis();
+        Serial.printf("[SYS] Auto Restart timer reset (%lu min)\n", autoRestartMin);
+    }
 
     if (sysStatusLabel) {
-        lv_label_set_text(sysStatusLabel, "Settings saved!");
-        lv_obj_set_style_text_color(sysStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+        if (e != nullptr) {
+            lv_label_set_text(sysStatusLabel, "Settings saved!");
+            lv_obj_set_style_text_color(sysStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else {
+            update_system_status_label();
+        }
     }
     Serial.printf("[SYS] AutoBL=%s(%lum) AutoRS=%s(%lum)\n",
         autoBacklightEnabled ? "ON" : "OFF", autoBacklightMin,
@@ -494,14 +628,37 @@ static void save_wifi_settings(lv_event_t *) {
         lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0xEF4444), LV_PART_MAIN | LV_STATE_DEFAULT);
         return;
     }
-    wifiPreferences.putString("ssid", lv_textarea_get_text(wifiSsidInput));
-    wifiPreferences.putString("pass", lv_textarea_get_text(wifiPasswordInput));
-    wifiPreferences.putString("ip", lv_textarea_get_text(wifiIpInput));
-    wifiPreferences.putString("mask", lv_textarea_get_text(wifiMaskInput));
-    wifiPreferences.putString("gw", lv_textarea_get_text(wifiGatewayInput));
-    wifiPreferences.putString("dns", lv_textarea_get_text(wifiDnsInput));
+
+    const char *ssid = wifiSsidInput ? lv_textarea_get_text(wifiSsidInput) : "";
+    const char *pass = wifiPasswordInput ? lv_textarea_get_text(wifiPasswordInput) : "";
+    const char *ipStr = wifiIpInput ? lv_textarea_get_text(wifiIpInput) : "192.168.1.50";
+    const char *maskStr = wifiMaskInput ? lv_textarea_get_text(wifiMaskInput) : "255.255.255.0";
+    const char *gwStr = wifiGatewayInput ? lv_textarea_get_text(wifiGatewayInput) : "192.168.1.1";
+    const char *dnsStr = wifiDnsInput ? lv_textarea_get_text(wifiDnsInput) : "8.8.8.8";
+
+    if (strlen(ssid) == 0) {
+        if (wifiStatusLabel) {
+            lv_label_set_text(wifiStatusLabel, "SSID cannot be empty");
+            lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0xEF4444), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+        return;
+    }
+
+    wifiPreferences.begin("wifi", false);
+    wifiPreferences.putString("ssid", ssid);
+    wifiPreferences.putString("pass", pass);
+    wifiPreferences.putString("ip", ipStr);
+    wifiPreferences.putString("mask", maskStr);
+    wifiPreferences.putString("gw", gwStr);
+    wifiPreferences.putString("dns", dnsStr);
     wifiPreferences.putBool("fix_ip", fixIp);
     wifiPreferences.putBool("dhcp", !fixIp);
+    wifiPreferences.putBool("enabled", true);
+    wifiPreferences.end();
+
+    if (wifiEnableSwitch) {
+        lv_obj_add_state(wifiEnableSwitch, LV_STATE_CHECKED);
+    }
 
     init_wifi_once();
     if (fixIp) {
@@ -514,9 +671,10 @@ static void save_wifi_settings(lv_event_t *) {
     } else {
         WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
     }
-    WiFi.begin(lv_textarea_get_text(wifiSsidInput), lv_textarea_get_text(wifiPasswordInput));
+    WiFi.begin(ssid, pass);
     lv_label_set_text(wifiStatusLabel, "Connecting to Wi-Fi...");
     lv_obj_set_style_text_color(wifiStatusLabel, lv_color_hex(0x38BDF8), LV_PART_MAIN | LV_STATE_DEFAULT);
+    Serial.printf("[WiFi] Settings saved & connecting to '%s'...\n", ssid);
 }
 
 static void on_wifi_ssid_selected(lv_event_t *e) {
@@ -682,6 +840,8 @@ static void load_mqtt_settings() {
     String clientId = mqttPreferences.getString("client_id", "ESP32_WaterLevel");
     String user = mqttPreferences.getString("user", "");
     String pass = mqttPreferences.getString("pass", "");
+    mqttPublishIntervalMs = mqttPreferences.getUInt("pub_int", 1000);
+    if (mqttPublishIntervalMs < 500) mqttPublishIntervalMs = 1000;
 
     if (mqttEnableSwitch) {
         if (mqttEnabled) lv_obj_add_state(mqttEnableSwitch, LV_STATE_CHECKED);
@@ -697,6 +857,7 @@ static void load_mqtt_settings() {
     if (mqttClientIdInput) lv_textarea_set_text(mqttClientIdInput, clientId.c_str());
     if (mqttUserInput) lv_textarea_set_text(mqttUserInput, user.c_str());
     if (mqttPassInput) lv_textarea_set_text(mqttPassInput, pass.c_str());
+    mqttPreferences.end();
 }
 
 static void save_mqtt_settings(lv_event_t *) {
@@ -717,6 +878,7 @@ static void save_mqtt_settings(lv_event_t *) {
     mqttPreferences.putString("client_id", clientId);
     mqttPreferences.putString("user", user);
     mqttPreferences.putString("pass", pass);
+    mqttPreferences.end();
 
     if (mqttClient.connected()) {
         mqttClient.disconnect();
@@ -741,11 +903,32 @@ static void mqtt_enable_changed(lv_event_t *) {
     }
 }
 
+static String get_mqtt_base_topic() {
+    mqttPreferences.begin("mqtt", false);
+    String topic = mqttPreferences.getString("topic", "water_level");
+    mqttPreferences.end();
+    topic.trim();
+    if (topic.endsWith("/data")) {
+        topic = topic.substring(0, topic.length() - 5);
+    } else if (topic.endsWith("/settings")) {
+        topic = topic.substring(0, topic.length() - 9);
+    } else if (topic.endsWith("/configs")) {
+        topic = topic.substring(0, topic.length() - 8);
+    }
+    while (topic.endsWith("/")) {
+        topic = topic.substring(0, topic.length() - 1);
+    }
+    if (topic.length() == 0) topic = "water_level";
+    return topic;
+}
+
+static uint32_t lastMqttSettingsPublishMs = 0;
+static uint32_t lastMqttConfigsPublishMs = 0;
+
 static void publish_mqtt_data() {
     if (!mqttClient.connected()) return;
 
-    mqttPreferences.begin("mqtt", false);
-    String topic = mqttPreferences.getString("topic", "water_level/data");
+    String topic = get_mqtt_base_topic() + "/data";
 
     // Sensor & level values
     float level_cm = 0.0f;
@@ -766,6 +949,12 @@ static void publish_mqtt_data() {
         tank_capacity_cm = 0.0f;
     }
 
+    float level_pct = 0.0f;
+    if (tank_capacity_cm > 0.0f) {
+        level_pct = (level_cm / tank_capacity_cm) * 100.0f;
+        level_pct = constrain(level_pct, 0.0f, 100.0f);
+    }
+
 #if WATER_METER_SENSOR_PRESENT
     if (water_meter_ok) {
         volumn = shared_volume_l;
@@ -779,16 +968,17 @@ static void publish_mqtt_data() {
     flow_rate = 0.0f;
 #endif
 
-    const bool valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
-    const bool pump1On = (shared_rs485_outputs & (1u << 1)) != 0;
-    const bool pump2On = (shared_rs485_outputs & (1u << 2)) != 0;
-    const bool alarmOn = alertOutputOn || ((shared_rs485_outputs & (1u << 3)) != 0);
+    const bool valveOn = (shared_rs485_outputs & (1u << valve_io_pin)) != 0;
+    const bool pump1On = shared_pump1_running || ((shared_rs485_outputs & (1u << pump1_io_pin)) != 0);
+    const bool pump2On = shared_pump2_running || ((shared_rs485_outputs & (1u << pump2_io_pin)) != 0);
+    const bool alarmOn = alertOutputOn || shared_pump1_alarm || shared_pump2_alarm || ((shared_rs485_outputs & (1u << alarm_io_pin)) != 0);
 
     JsonDocument doc;
 
     // 1. Water Level
     JsonObject levelObj = doc["water_level"].to<JsonObject>();
     levelObj["level_cm"] = serialized(String(level_cm, 1));
+    levelObj["level_pct"] = serialized(String(level_pct, 1));
     levelObj["volumn"] = serialized(String(volumn, 3));
     levelObj["flow_rate"] = serialized(String(flow_rate, 3));
     levelObj["tank_capacity_cm"] = serialized(String(tank_capacity_cm, 1));
@@ -799,13 +989,51 @@ static void publish_mqtt_data() {
     ctrlObj["pump1_on"] = pump1On;
     ctrlObj["pump2_on"] = pump2On;
     ctrlObj["alarm_on"] = alarmOn;
+    ctrlObj["pump1_alarm"] = shared_pump1_alarm;
+    ctrlObj["pump2_alarm"] = shared_pump2_alarm;
     ctrlObj["auto_mode"] = waterSettings.autoMode;
     ctrlObj["auto_pump1"] = waterSettings.autoPump1;
     ctrlObj["auto_pump2"] = waterSettings.autoPump2;
     ctrlObj["manual_pump1"] = waterSettings.manualPump1;
     ctrlObj["manual_pump2"] = waterSettings.manualPump2;
     ctrlObj["manual_valve"] = waterSettings.manualValve;
+    ctrlObj["manual_speed_pump1"] = serialized(String(waterSettings.manualSpeedPump1, 1));
+    ctrlObj["manual_speed_pump2"] = serialized(String(waterSettings.manualSpeedPump2, 1));
+    ctrlObj["pressure_bar"] = serialized(String(shared_pressure_bar, 2));
+    ctrlObj["set_pressure"] = serialized(String(waterSettings.setPressure, 2));
+    ctrlObj["pid_kp"] = serialized(String(waterSettings.pidKp, 2));
+    ctrlObj["pid_ki"] = serialized(String(waterSettings.pidKi, 2));
+    ctrlObj["acc_dec"] = serialized(String(waterSettings.accDec, 1));
+    ctrlObj["sleep_freq"] = serialized(String(waterSettings.sleepFreq, 1));
+    ctrlObj["sleep_delay_sec"] = waterSettings.sleepDelaySec;
+    ctrlObj["is_sleeping"] = shared_is_sleeping;
+    ctrlObj["lower_limit_cm"] = serialized(String(waterSettings.lowerLimitCm, 1));
+    ctrlObj["sensor_type_switch"] = waterSettings.sensorTypeSwitch;
+    ctrlObj["sensor_type"] = waterSettings.sensorTypeSwitch ? "pressure_switch" : "rs485";
     ctrlObj["pressure_switch"] = shared_pressure_switch;
+    ctrlObj["pressure_sensor_ok"] = pressure_sensor_ok;
+    ctrlObj["pid_target_freq"] = serialized(String(shared_pid_target_freq, 1));
+
+    // Inverter Pump 1 and Pump 2 individual statuses
+    JsonObject p1Obj = doc["pump1"].to<JsonObject>();
+    p1Obj["running"] = shared_pump1_running;
+    p1Obj["alarm"] = shared_pump1_alarm;
+    p1Obj["freq"] = serialized(String(shared_pump1_freq, 1));
+    p1Obj["current"] = serialized(String(shared_pump1_current, 1));
+    p1Obj["status_word"] = shared_pump1_status;
+    p1Obj["auto_enabled"] = waterSettings.autoPump1;
+    p1Obj["manual_enabled"] = waterSettings.manualPump1;
+    p1Obj["modbus_ok"] = pump1_modbus_ok;
+
+    JsonObject p2Obj = doc["pump2"].to<JsonObject>();
+    p2Obj["running"] = shared_pump2_running;
+    p2Obj["alarm"] = shared_pump2_alarm;
+    p2Obj["freq"] = serialized(String(shared_pump2_freq, 1));
+    p2Obj["current"] = serialized(String(shared_pump2_current, 1));
+    p2Obj["status_word"] = shared_pump2_status;
+    p2Obj["auto_enabled"] = waterSettings.autoPump2;
+    p2Obj["manual_enabled"] = waterSettings.manualPump2;
+    p2Obj["modbus_ok"] = pump2_modbus_ok;
 
     // 3. Local IO
     JsonObject localObj = doc["local_io"].to<JsonObject>();
@@ -819,14 +1047,14 @@ static void publish_mqtt_data() {
     rs485Obj["status_ok"] = rs485_io_ok;
 
     JsonObject inObj = rs485Obj["input"].to<JsonObject>();
-    inObj["di1"] = ((shared_rs485_inputs >> 0) & 1) != 0;
-    inObj["di2"] = ((shared_rs485_inputs >> 1) & 1) != 0;
-    inObj["di3"] = ((shared_rs485_inputs >> 2) & 1) != 0;
-    inObj["di4"] = ((shared_rs485_inputs >> 3) & 1) != 0;
-    inObj["di5"] = ((shared_rs485_inputs >> 4) & 1) != 0;
-    inObj["di6"] = ((shared_rs485_inputs >> 5) & 1) != 0;
-    inObj["di7"] = ((shared_rs485_inputs >> 6) & 1) != 0;
-    inObj["di8"] = ((shared_rs485_inputs >> 7) & 1) != 0;
+    inObj["di1"] = shared_pressure_switch;
+    inObj["di2"] = shared_pump1_overload;
+    inObj["di3"] = shared_pump2_overload;
+    inObj["di4"] = ((shared_rs485_inputs >> rs485_di4_io_pin) & 1) != 0;
+    inObj["di5"] = ((shared_rs485_inputs >> rs485_di5_io_pin) & 1) != 0;
+    inObj["di6"] = ((shared_rs485_inputs >> rs485_di6_io_pin) & 1) != 0;
+    inObj["di7"] = ((shared_rs485_inputs >> rs485_di7_io_pin) & 1) != 0;
+    inObj["di8"] = ((shared_rs485_inputs >> rs485_di8_io_pin) & 1) != 0;
 
     JsonObject outObj = rs485Obj["output"].to<JsonObject>();
     outObj["ch1"] = ((shared_rs485_outputs >> 0) & 1) != 0;
@@ -843,11 +1071,614 @@ static void publish_mqtt_data() {
     sysObj["wifi_rssi"] = WiFi.RSSI();
     sysObj["ip"] = WiFi.localIP().toString();
     sysObj["sensor_comm_ok"] = lastRs485Ok;
+    sysObj["rs485_io_ok"] = rs485_io_ok;
+    sysObj["meter_comm_ok"] = water_meter_ok;
+    sysObj["level_comm_ok"] = lastRs485Ok;
+    sysObj["pump1_comm_ok"] = pump1_modbus_ok;
+    sysObj["pump2_comm_ok"] = pump2_modbus_ok;
+    sysObj["pressure_comm_ok"] = pressure_sensor_ok;
     sysObj["uptime_sec"] = millis() / 1000;
 
     String payload;
     serializeJson(doc, payload);
     mqttClient.publish(topic.c_str(), payload.c_str());
+    // Also publish to root base topic so subscribing directly without /# or /data also receives it
+    String baseTopic = get_mqtt_base_topic();
+    if (baseTopic != topic) {
+        mqttClient.publish(baseTopic.c_str(), payload.c_str());
+    }
+}
+
+static void publish_mqtt_settings() {
+    if (!mqttClient.connected()) return;
+
+    String topic = get_mqtt_base_topic() + "/settings";
+
+    JsonDocument doc;
+    doc["valve_on_cm"] = serialized(String(waterSettings.valveOnCm, 1));
+    doc["tank_capacity"] = serialized(String(waterSettings.tankCapacity, 1));
+    doc["valve_period_sec"] = serialized(String(waterSettings.valvePeriodSec, 1));
+    doc["alert_min_cm"] = serialized(String(waterSettings.alertMinCm, 1));
+    doc["alert_max_cm"] = serialized(String(waterSettings.alertMaxCm, 1));
+    doc["alert_period_sec"] = waterSettings.alertPeriodSec;
+    doc["lower_limit_cm"] = serialized(String(waterSettings.lowerLimitCm, 1));
+    doc["auto_mode"] = waterSettings.autoMode;
+    doc["auto_pump1"] = waterSettings.autoPump1;
+    doc["auto_pump2"] = waterSettings.autoPump2;
+    doc["manual_pump1"] = waterSettings.manualPump1;
+    doc["manual_pump2"] = waterSettings.manualPump2;
+    doc["manual_valve"] = waterSettings.manualValve;
+    doc["manual_speed_pump1"] = serialized(String(waterSettings.manualSpeedPump1, 1));
+    doc["manual_speed_pump2"] = serialized(String(waterSettings.manualSpeedPump2, 1));
+    doc["pid_kp"] = serialized(String(waterSettings.pidKp, 2));
+    doc["pid_ki"] = serialized(String(waterSettings.pidKi, 2));
+    doc["acc_dec"] = serialized(String(waterSettings.accDec, 1));
+    doc["set_pressure"] = serialized(String(waterSettings.setPressure, 2));
+    doc["sleep_freq"] = serialized(String(waterSettings.sleepFreq, 1));
+    doc["sleep_delay_sec"] = waterSettings.sleepDelaySec;
+    doc["sensor_type_switch"] = waterSettings.sensorTypeSwitch;
+    doc["sensor_type"] = waterSettings.sensorTypeSwitch ? "pressure_switch" : "rs485";
+
+    String payload;
+    serializeJson(doc, payload);
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+static void publish_mqtt_configs() {
+    if (!mqttClient.connected()) return;
+
+    String topic = get_mqtt_base_topic() + "/configs";
+
+    JsonDocument doc;
+
+    JsonObject sysObj = doc["system"].to<JsonObject>();
+    sysObj["device"] = "Waveshare ESP32-S3 Touch LCD 4.3B";
+    sysObj["firmware_version"] = "1.1.0";
+    sysObj["uptime_sec"] = millis() / 1000;
+    sysObj["free_heap"] = ESP.getFreeHeap();
+
+    JsonObject pwrObj = doc["power_system"].to<JsonObject>();
+    pwrObj["auto_backlight_enabled"] = autoBacklightEnabled;
+    pwrObj["auto_backlight_min"] = autoBacklightMin;
+    pwrObj["auto_restart_enabled"] = autoRestartEnabled;
+    pwrObj["auto_restart_min"] = autoRestartMin;
+
+    JsonObject mbObj = doc["modbus"].to<JsonObject>();
+    mbObj["baud_rate"] = MODBUS_BAUD_RATE;
+
+    JsonObject meterCfg = mbObj["water_meter"].to<JsonObject>();
+    meterCfg["slave_id"] = WATER_METER_SLAVE_ID;
+    meterCfg["poll_ms"] = WATER_METER_POLL_MS;
+
+    JsonObject rs485IoCfg = mbObj["rs485_io"].to<JsonObject>();
+    rs485IoCfg["slave_id"] = RS485_IO_SLAVE_ID;
+    rs485IoCfg["poll_ms"] = RS485_IO_POLL_MS;
+
+    JsonObject levelSensor = mbObj["level_sensor"].to<JsonObject>();
+    levelSensor["slave_id"] = MODBUS_SLAVE_ID;
+    levelSensor["start_reg"] = MODBUS_START_REG;
+    levelSensor["reg_count"] = MODBUS_REG_COUNT;
+    levelSensor["poll_ms"] = MODBUS_POLL_MS;
+
+    JsonObject inv1Cfg = mbObj["inverter_pump1"].to<JsonObject>();
+    inv1Cfg["slave_id"] = INVERTER_PUMP1_SLAVE_ID;
+    inv1Cfg["poll_ms"] = DEFAULT_INVERTER_POLL_MS;
+
+    JsonObject inv2Cfg = mbObj["inverter_pump2"].to<JsonObject>();
+    inv2Cfg["slave_id"] = INVERTER_PUMP2_SLAVE_ID;
+    inv2Cfg["poll_ms"] = DEFAULT_INVERTER_POLL_MS;
+
+    JsonObject pressCfg = mbObj["pressure_sensor"].to<JsonObject>();
+    pressCfg["slave_id"] = PRESSURE_SLAVE_ID;
+    pressCfg["poll_ms"] = DEFAULT_PRESSURE_POLL_MS;
+
+    JsonObject netObj = doc["network"].to<JsonObject>();
+    netObj["ip"] = WiFi.localIP().toString();
+    netObj["mac"] = WiFi.macAddress();
+    netObj["wifi_rssi"] = WiFi.RSSI();
+
+    JsonObject mqttObj = doc["mqtt"].to<JsonObject>();
+    mqttObj["base_topic"] = get_mqtt_base_topic();
+
+    String payload;
+    serializeJson(doc, payload);
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+static void mqtt_callback(char *topic, byte *payload, unsigned int length) {
+    if (!payload || length == 0) return;
+
+    String topicStr = String(topic);
+    String base = get_mqtt_base_topic();
+
+    // Ignore telemetry and broadcast topics under all conditions to prevent feedback loops
+    if (topicStr.endsWith("/data") || 
+        topicStr.endsWith("/settings") || 
+        topicStr.endsWith("/configs") ||
+        topicStr.indexOf("/data/") >= 0 ||
+        topicStr.indexOf("/settings/") >= 0 ||
+        topicStr.indexOf("/configs/") >= 0) {
+        return;
+    }
+
+    // Only process topics intended for commands or settings
+    if (topicStr.indexOf("/set") < 0 && 
+        topicStr.indexOf("/control") < 0 && 
+        topicStr.indexOf("/command") < 0 && 
+        topicStr.indexOf("/cmd") < 0) {
+        return;
+    }
+
+    String payloadStr;
+    payloadStr.reserve(length + 1);
+    for (unsigned int i = 0; i < length; i++) {
+        payloadStr += (char)payload[i];
+    }
+    payloadStr.trim();
+    Serial.printf("[MQTT RX] Topic: %s | Payload: %s\n", topic, payloadStr.c_str());
+
+    JsonDocument doc;
+    bool isJson = false;
+    if (payloadStr.startsWith("{") && payloadStr.endsWith("}")) {
+        DeserializationError err = deserializeJson(doc, payloadStr);
+        if (!err && doc.is<JsonObject>()) {
+            isJson = true;
+        }
+    }
+
+    if (!isJson) {
+        String sub = topicStr;
+        if (sub.startsWith(base)) {
+            sub = sub.substring(base.length());
+        }
+        while (sub.startsWith("/")) sub = sub.substring(1);
+        if (sub.startsWith("set/")) sub = sub.substring(4);
+        else if (sub.startsWith("cmd/")) sub = sub.substring(4);
+        else if (sub.startsWith("command/")) sub = sub.substring(8);
+        else if (sub.startsWith("control/")) sub = sub.substring(8);
+        else if (sub.startsWith("settings/set/")) sub = sub.substring(13);
+        else if (sub.startsWith("configs/set/")) sub = sub.substring(12);
+
+        sub.toLowerCase();
+
+        if (sub.length() > 0 && sub != "set" && sub != "cmd" && sub != "command" && sub != "control") {
+            String lowerVal = payloadStr;
+            lowerVal.toLowerCase();
+            if (lowerVal == "true" || lowerVal == "on" || lowerVal == "open" || lowerVal == "run" || lowerVal == "1") {
+                doc[sub] = true;
+            } else if (lowerVal == "false" || lowerVal == "off" || lowerVal == "close" || lowerVal == "stop" || lowerVal == "0") {
+                doc[sub] = false;
+            } else {
+                char *endPtr = nullptr;
+                float num = strtof(payloadStr.c_str(), &endPtr);
+                if (endPtr != payloadStr.c_str() && *endPtr == '\0') {
+                    doc[sub] = num;
+                } else {
+                    doc[sub] = payloadStr;
+                }
+            }
+        } else {
+            DeserializationError err = deserializeJson(doc, payloadStr);
+            if (err) {
+                Serial.printf("[MQTT RX ERR] Invalid payload for topic %s: %s\n", topic, payloadStr.c_str());
+                return;
+            }
+        }
+    }
+
+    bool settingsChanged = false;
+    bool modeChanged = false;
+    bool sysChanged = false;
+    const float maxLevelCm = configuredLevelMaxCm();
+
+    // 0. MQTT Telemetry Publish Interval
+    if (!doc["telemetry_interval"].isNull()) {
+        uint32_t sec = doc["telemetry_interval"].as<uint32_t>();
+        if (sec >= 1 && sec <= 3600) {
+            mqttPublishIntervalMs = sec * 1000UL;
+            mqttPreferences.begin("mqtt", false);
+            mqttPreferences.putUInt("pub_int", mqttPublishIntervalMs);
+            mqttPreferences.end();
+            Serial.printf("[MQTT] Telemetry interval set to %u s\n", sec);
+        }
+    } else if (!doc["interval_sec"].isNull()) {
+        uint32_t sec = doc["interval_sec"].as<uint32_t>();
+        if (sec >= 1 && sec <= 3600) {
+            mqttPublishIntervalMs = sec * 1000UL;
+            mqttPreferences.begin("mqtt", false);
+            mqttPreferences.putUInt("pub_int", mqttPublishIntervalMs);
+            mqttPreferences.end();
+            Serial.printf("[MQTT] Telemetry interval set to %u s\n", sec);
+        }
+    }
+
+    // 1. Water Level Threshold Settings
+    if (!doc["valve_on_cm"].isNull()) {
+        waterSettings.valveOnCm = constrain(doc["valve_on_cm"].as<float>(), 0.0f, maxLevelCm);
+        settingsChanged = true;
+    }
+    if (!doc["tank_capacity"].isNull()) {
+        waterSettings.tankCapacity = constrain(doc["tank_capacity"].as<float>(), 0.1f, 1000000.0f);
+        settingsChanged = true;
+    }
+    if (!doc["valve_period_sec"].isNull()) {
+        waterSettings.valvePeriodSec = constrain(doc["valve_period_sec"].as<float>(), 0.1f, 86400.0f);
+        settingsChanged = true;
+    }
+    if (!doc["pump_delay_sec"].isNull()) {
+        waterSettings.sleepDelaySec = constrain(doc["pump_delay_sec"].as<uint32_t>(), (uint32_t)0, (uint32_t)3600);
+        settingsChanged = true;
+    }
+    if (!doc["sleep_delay_sec"].isNull()) {
+        waterSettings.sleepDelaySec = constrain(doc["sleep_delay_sec"].as<uint32_t>(), (uint32_t)0, (uint32_t)3600);
+        settingsChanged = true;
+    }
+    if (!doc["sleep_delay"].isNull()) {
+        waterSettings.sleepDelaySec = constrain(doc["sleep_delay"].as<uint32_t>(), (uint32_t)0, (uint32_t)3600);
+        settingsChanged = true;
+    }
+    if (!doc["pid_kp"].isNull()) {
+        waterSettings.pidKp = constrain(doc["pid_kp"].as<float>(), 0.0f, 100.0f);
+        settingsChanged = true;
+    } else if (!doc["kp"].isNull()) {
+        waterSettings.pidKp = constrain(doc["kp"].as<float>(), 0.0f, 100.0f);
+        settingsChanged = true;
+    }
+    if (!doc["pid_ki"].isNull()) {
+        waterSettings.pidKi = constrain(doc["pid_ki"].as<float>(), 0.0f, 100.0f);
+        settingsChanged = true;
+    } else if (!doc["ki"].isNull()) {
+        waterSettings.pidKi = constrain(doc["ki"].as<float>(), 0.0f, 100.0f);
+        settingsChanged = true;
+    }
+    if (!doc["acc_dec"].isNull()) {
+        waterSettings.accDec = constrain(doc["acc_dec"].as<float>(), 0.1f, 3600.0f);
+        settingsChanged = true;
+    } else if (!doc["acc"].isNull()) {
+        waterSettings.accDec = constrain(doc["acc"].as<float>(), 0.1f, 3600.0f);
+        settingsChanged = true;
+    } else if (!doc["dec"].isNull()) {
+        waterSettings.accDec = constrain(doc["dec"].as<float>(), 0.1f, 3600.0f);
+        settingsChanged = true;
+    } else if (!doc["accel"].isNull()) {
+        waterSettings.accDec = constrain(doc["accel"].as<float>(), 0.1f, 3600.0f);
+        settingsChanged = true;
+    } else if (!doc["decel"].isNull()) {
+        waterSettings.accDec = constrain(doc["decel"].as<float>(), 0.1f, 3600.0f);
+        settingsChanged = true;
+    }
+    if (!doc["set_pressure"].isNull()) {
+        waterSettings.setPressure = constrain(doc["set_pressure"].as<float>(), 0.0f, 6.0f);
+        settingsChanged = true;
+    } else if (!doc["pressure"].isNull() && (doc["pressure"].is<float>() || doc["pressure"].is<int>())) {
+        waterSettings.setPressure = constrain(doc["pressure"].as<float>(), 0.0f, 6.0f);
+        settingsChanged = true;
+    } else if (!doc["sp"].isNull()) {
+        waterSettings.setPressure = constrain(doc["sp"].as<float>(), 0.0f, 6.0f);
+        settingsChanged = true;
+    }
+    if (!doc["sleep_freq"].isNull()) {
+        waterSettings.sleepFreq = constrain(doc["sleep_freq"].as<float>(), 0.0f, 50.0f);
+        settingsChanged = true;
+    }
+    if (!doc["alert_min_cm"].isNull()) {
+        waterSettings.alertMinCm = constrain(doc["alert_min_cm"].as<float>(), 0.0f, maxLevelCm);
+        settingsChanged = true;
+    }
+    if (!doc["alert_max_cm"].isNull()) {
+        waterSettings.alertMaxCm = constrain(doc["alert_max_cm"].as<float>(), 0.0f, maxLevelCm);
+        settingsChanged = true;
+    }
+    if (!doc["alert_period_sec"].isNull()) {
+        waterSettings.alertPeriodSec = constrain(doc["alert_period_sec"].as<uint32_t>(), (uint32_t)1, (uint32_t)86400);
+        settingsChanged = true;
+    }
+    if (!doc["lower_limit_cm"].isNull()) {
+        waterSettings.lowerLimitCm = constrain(doc["lower_limit_cm"].as<float>(), 0.0f, maxLevelCm);
+        settingsChanged = true;
+    } else if (!doc["lower_limit"].isNull()) {
+        waterSettings.lowerLimitCm = constrain(doc["lower_limit"].as<float>(), 0.0f, maxLevelCm);
+        settingsChanged = true;
+    }
+
+    // Sensor Type (RS485 vs Pressure Switch)
+    if (!doc["sensor_type"].isNull()) {
+        if (doc["sensor_type"].is<bool>()) {
+            waterSettings.sensorTypeSwitch = doc["sensor_type"].as<bool>();
+            settingsChanged = true;
+        } else {
+            String st = doc["sensor_type"].as<String>();
+            st.toLowerCase();
+            if (st == "pressure_switch" || st == "switch" || st == "sw" || st == "1" || st == "true") {
+                waterSettings.sensorTypeSwitch = true;
+                settingsChanged = true;
+            } else if (st == "rs485" || st == "sensor" || st == "modbus" || st == "0" || st == "false") {
+                waterSettings.sensorTypeSwitch = false;
+                settingsChanged = true;
+            }
+        }
+    }
+    if (!doc["sensor_type_switch"].isNull()) {
+        waterSettings.sensorTypeSwitch = doc["sensor_type_switch"].as<bool>();
+        settingsChanged = true;
+    }
+    if (!doc["sensor_switch"].isNull()) {
+        waterSettings.sensorTypeSwitch = doc["sensor_switch"].as<bool>();
+        settingsChanged = true;
+    }
+
+    if (waterSettings.alertMinCm >= waterSettings.alertMaxCm) {
+        waterSettings.alertMaxCm = min(maxLevelCm, waterSettings.alertMinCm + 1.0f);
+    }
+
+    // 2. Mode and Control Commands
+    if (!doc["mode"].isNull()) {
+        if (doc["mode"].is<bool>()) {
+            waterSettings.autoMode = doc["mode"].as<bool>();
+        } else {
+            String m = doc["mode"].as<String>();
+            m.toLowerCase();
+            waterSettings.autoMode = (m == "auto" || m == "1" || m == "true");
+        }
+        modeChanged = true;
+    }
+    if (!doc["auto_mode"].isNull()) {
+        waterSettings.autoMode = doc["auto_mode"].as<bool>();
+        modeChanged = true;
+    }
+
+    if (!doc["auto_pump1"].isNull()) {
+        waterSettings.autoPump1 = doc["auto_pump1"].as<bool>();
+        modeChanged = true;
+    }
+    if (!doc["auto_pump2"].isNull()) {
+        waterSettings.autoPump2 = doc["auto_pump2"].as<bool>();
+        modeChanged = true;
+    }
+    if (!doc["manual_pump1"].isNull()) {
+        waterSettings.manualPump1 = doc["manual_pump1"].as<bool>();
+        modeChanged = true;
+    }
+    if (!doc["manual_pump2"].isNull()) {
+        waterSettings.manualPump2 = doc["manual_pump2"].as<bool>();
+        modeChanged = true;
+    }
+    if (!doc["manual_valve"].isNull()) {
+        waterSettings.manualValve = doc["manual_valve"].as<bool>();
+        manualValveOverride = waterSettings.manualValve;
+        set_rs485_output(valve_io_pin, waterSettings.manualValve);
+        modeChanged = true;
+    }
+    if (!doc["manual_speed_pump1"].isNull()) {
+        waterSettings.manualSpeedPump1 = constrain(doc["manual_speed_pump1"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    } else if (!doc["speed_pump1"].isNull()) {
+        waterSettings.manualSpeedPump1 = constrain(doc["speed_pump1"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    } else if (!doc["speed1"].isNull()) {
+        waterSettings.manualSpeedPump1 = constrain(doc["speed1"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    }
+
+    if (!doc["manual_speed_pump2"].isNull()) {
+        waterSettings.manualSpeedPump2 = constrain(doc["manual_speed_pump2"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    } else if (!doc["speed_pump2"].isNull()) {
+        waterSettings.manualSpeedPump2 = constrain(doc["speed_pump2"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    } else if (!doc["speed2"].isNull()) {
+        waterSettings.manualSpeedPump2 = constrain(doc["speed2"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        settingsChanged = true;
+    }
+
+    if (!doc["speed"].isNull()) {
+        float spd = constrain(doc["speed"].as<float>(), waterSettings.sleepFreq, 50.0f);
+        waterSettings.manualSpeedPump1 = spd;
+        waterSettings.manualSpeedPump2 = spd;
+        settingsChanged = true;
+    }
+
+    // Pump 1 command
+    if (!doc["pump1"].isNull() || !doc["pump1_on"].isNull()) {
+        bool cmd = !doc["pump1"].isNull() ? doc["pump1"].as<bool>() : doc["pump1_on"].as<bool>();
+        if (waterSettings.autoMode) waterSettings.autoPump1 = cmd;
+        else waterSettings.manualPump1 = cmd;
+        modeChanged = true;
+    }
+
+    // Pump 2 command
+    if (!doc["pump2"].isNull() || !doc["pump2_on"].isNull()) {
+        bool cmd = !doc["pump2"].isNull() ? doc["pump2"].as<bool>() : doc["pump2_on"].as<bool>();
+        if (waterSettings.autoMode) waterSettings.autoPump2 = cmd;
+        else waterSettings.manualPump2 = cmd;
+        modeChanged = true;
+    }
+
+    // Valve command
+    if (!doc["valve"].isNull() || !doc["valve_on"].isNull()) {
+        bool cmd = !doc["valve"].isNull() ? doc["valve"].as<bool>() : doc["valve_on"].as<bool>();
+        waterSettings.manualValve = cmd;
+        manualValveOverride = cmd;
+        set_rs485_output(valve_io_pin, cmd);
+        modeChanged = true;
+    }
+
+    // Alarm command
+    if (!doc["alarm"].isNull() || !doc["alarm_on"].isNull()) {
+        bool cmd = doc["alarm"] | doc["alarm_on"];
+        set_rs485_output(alarm_io_pin, cmd);
+    }
+
+    // Local IO Output (DO0, DO1)
+    if (!doc["local_io"]["do0"].isNull()) {
+        set_output_state(0, doc["local_io"]["do0"].as<bool>());
+        modeChanged = true;
+    } else if (!doc["do0"].isNull()) {
+        set_output_state(0, doc["do0"].as<bool>());
+        modeChanged = true;
+    }
+    if (!doc["local_io"]["do1"].isNull()) {
+        set_output_state(1, doc["local_io"]["do1"].as<bool>());
+        modeChanged = true;
+    } else if (!doc["local_do1"].isNull()) {
+        set_output_state(1, doc["local_do1"].as<bool>());
+        modeChanged = true;
+    } else if (!doc["do1"].isNull() && doc["rs485_io"].isNull()) {
+        set_output_state(1, doc["do1"].as<bool>());
+        modeChanged = true;
+    }
+
+    // RS485 direct output channels (do1..do8 / ch1..ch8)
+    for (uint8_t ch = 1; ch <= 8; ch++) {
+        char chKey[8];
+        char doKey[8];
+        snprintf(chKey, sizeof(chKey), "ch%u", ch);
+        snprintf(doKey, sizeof(doKey), "do%u", ch);
+
+        bool hasVal = false;
+        bool state = false;
+
+        if (!doc["rs485_io"].isNull()) {
+            if (!doc["rs485_io"][doKey].isNull()) {
+                state = doc["rs485_io"][doKey].as<bool>();
+                hasVal = true;
+            } else if (!doc["rs485_io"][chKey].isNull()) {
+                state = doc["rs485_io"][chKey].as<bool>();
+                hasVal = true;
+            } else if (!doc["rs485_io"]["output"][chKey].isNull()) {
+                state = doc["rs485_io"]["output"][chKey].as<bool>();
+                hasVal = true;
+            } else if (!doc["rs485_io"]["output"][doKey].isNull()) {
+                state = doc["rs485_io"]["output"][doKey].as<bool>();
+                hasVal = true;
+            }
+        }
+        if (!hasVal) {
+            if (!doc[chKey].isNull()) {
+                state = doc[chKey].as<bool>();
+                hasVal = true;
+            } else {
+                char rs485DoKey[16];
+                snprintf(rs485DoKey, sizeof(rs485DoKey), "rs485_do%u", ch);
+                if (!doc[rs485DoKey].isNull()) {
+                    state = doc[rs485DoKey].as<bool>();
+                    hasVal = true;
+                }
+            }
+        }
+
+        if (hasVal) {
+            if (ch - 1 == pump1_io_pin) {
+                if (waterSettings.autoMode) waterSettings.autoPump1 = state;
+                else waterSettings.manualPump1 = state;
+                modeChanged = true;
+            } else if (ch - 1 == pump2_io_pin) {
+                if (waterSettings.autoMode) waterSettings.autoPump2 = state;
+                else waterSettings.manualPump2 = state;
+                modeChanged = true;
+            } else if (ch - 1 == valve_io_pin) {
+                waterSettings.manualValve = state;
+                manualValveOverride = state;
+                set_rs485_output(valve_io_pin, state);
+                modeChanged = true;
+            } else {
+                set_rs485_output(ch - 1, state);
+                modeChanged = true;
+            }
+        }
+    }
+
+    // 3. System & Power Configs
+    if (!doc["auto_backlight_enabled"].isNull()) {
+        autoBacklightEnabled = doc["auto_backlight_enabled"].as<bool>();
+        sysChanged = true;
+    }
+    if (!doc["auto_backlight_min"].isNull()) {
+        autoBacklightMin = constrain(doc["auto_backlight_min"].as<uint32_t>(), (uint32_t)1, (uint32_t)1440);
+        sysChanged = true;
+    }
+    if (!doc["auto_restart_enabled"].isNull()) {
+        autoRestartEnabled = doc["auto_restart_enabled"].as<bool>();
+        sysChanged = true;
+    }
+    if (!doc["auto_restart_min"].isNull()) {
+        autoRestartMin = constrain(doc["auto_restart_min"].as<uint32_t>(), (uint32_t)1, (uint32_t)10080);
+        sysChanged = true;
+    }
+    if (!doc["backlight"].isNull()) {
+        bool bl = doc["backlight"].as<bool>();
+        if (bl) { BL_ON; isBacklightOn = true; }
+        else { BL_OFF; isBacklightOn = false; }
+    }
+
+    // 4. Modbus Configs
+    bool modbusChanged = false;
+    if (!doc["baud_rate"].isNull()) {
+        uint32_t br = doc["baud_rate"].as<uint32_t>();
+        if (br == 4800 || br == 9600 || br == 19200 || br == 38400 || br == 57600 || br == 115200) {
+            MODBUS_BAUD_RATE = br;
+            modbusChanged = true;
+        }
+    }
+    if (!doc["level_slave_id"].isNull()) {
+        MODBUS_SLAVE_ID = constrain(doc["level_slave_id"].as<uint8_t>(), (uint8_t)1, (uint8_t)247);
+        modbusChanged = true;
+    }
+    if (!doc["level_poll_ms"].isNull()) {
+        MODBUS_POLL_MS = constrain(doc["level_poll_ms"].as<uint32_t>(), (uint32_t)50, (uint32_t)60000);
+        modbusChanged = true;
+    }
+
+    // 5. Apply changes, persist, and update UI
+    if (modeChanged || settingsChanged) {
+        if (waterSettings.autoMode) {
+            waterSettings.manualPump1 = false;
+            waterSettings.manualPump2 = false;
+            waterSettings.manualValve = false;
+            manualValveOverride = false;
+            set_rs485_output(valve_io_pin, false);
+        } else {
+            set_rs485_output(valve_io_pin, waterSettings.manualValve);
+            manualValveOverride = waterSettings.manualValve;
+        }
+
+        save_water_settings();
+
+        if (lvgl_port_lock(50)) {
+            if (settingsChanged) update_settings_ui();
+            if (modeChanged) update_mode_ui();
+            update_manual_leds();
+            lvgl_port_unlock();
+        }
+
+        publish_mqtt_settings();
+    }
+
+    if (sysChanged) {
+        sysPreferences.begin("sys", false);
+        sysPreferences.putBool("auto_bl", autoBacklightEnabled);
+        sysPreferences.putUInt("bl_min", autoBacklightMin);
+        sysPreferences.putBool("auto_rs", autoRestartEnabled);
+        sysPreferences.putUInt("rs_min", autoRestartMin);
+        sysPreferences.end();
+
+        if (lvgl_port_lock(50)) {
+            update_system_status_label();
+            lvgl_port_unlock();
+        }
+        publish_mqtt_configs();
+    }
+
+    if (modbusChanged) {
+        publish_mqtt_configs();
+    }
+
+    // Remote Restart / Reboot Command
+    if (doc["restart"] == true || doc["reboot"] == true) {
+        Serial.println("[MQTT] Remote reboot command received! Restarting in 500ms...");
+        delay(500);
+        ESP.restart();
+    }
 }
 
 static void handle_mqtt_loop() {
@@ -866,10 +1697,12 @@ static void handle_mqtt_loop() {
             String clientId = mqttPreferences.getString("client_id", "ESP32_WaterLevel");
             String user = mqttPreferences.getString("user", "");
             String pass = mqttPreferences.getString("pass", "");
+            mqttPreferences.end();
 
             if (server.length() > 0) {
                 mqttClient.setServer(server.c_str(), port);
-                mqttClient.setBufferSize(1024);
+                mqttClient.setBufferSize(2048);
+                mqttClient.setCallback(mqtt_callback);
                 Serial.printf("[MQTT] Connecting to %s:%u as %s...\n", server.c_str(), port, clientId.c_str());
                 bool ok = false;
                 if (user.length() > 0) {
@@ -880,6 +1713,18 @@ static void handle_mqtt_loop() {
 
                 if (ok) {
                     Serial.println("[MQTT] Connected successfully!");
+                    String base = get_mqtt_base_topic();
+                    mqttClient.subscribe(String(base + "/set").c_str());
+                    mqttClient.subscribe(String(base + "/set/#").c_str());
+                    mqttClient.subscribe(String(base + "/control").c_str());
+                    mqttClient.subscribe(String(base + "/control/#").c_str());
+                    mqttClient.subscribe(String(base + "/command").c_str());
+                    mqttClient.subscribe(String(base + "/command/#").c_str());
+                    mqttClient.subscribe(String(base + "/cmd/#").c_str());
+                    mqttClient.subscribe(String(base + "/settings/set").c_str());
+                    mqttClient.subscribe(String(base + "/configs/set").c_str());
+                    Serial.printf("[MQTT] Subscribed to %s/[set, control, command, cmd, settings/set, configs/set]\n", base.c_str());
+
                     if (mqttStatusLabel && lvgl_port_lock(5)) {
                         char msg[80];
                         snprintf(msg, sizeof(msg), "Connected: %s", server.c_str());
@@ -887,6 +1732,10 @@ static void handle_mqtt_loop() {
                         lv_obj_set_style_text_color(mqttStatusLabel, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
                         lvgl_port_unlock();
                     }
+
+                    publish_mqtt_data();
+                    publish_mqtt_settings();
+                    publish_mqtt_configs();
                 } else {
                     Serial.printf("[MQTT] Connect failed, rc=%d\n", mqttClient.state());
                     if (mqttStatusLabel && lvgl_port_lock(5)) {
@@ -901,12 +1750,114 @@ static void handle_mqtt_loop() {
         }
     } else {
         mqttClient.loop();
-        if (now - lastMqttPublishMs >= 1000) {
+        if (now - lastMqttPublishMs >= mqttPublishIntervalMs) {
             lastMqttPublishMs = now;
             publish_mqtt_data();
         }
+        if (now - lastMqttSettingsPublishMs >= 1000) {
+            lastMqttSettingsPublishMs = now;
+            publish_mqtt_settings();
+        }
+        if (now - lastMqttConfigsPublishMs >= 30000) {
+            lastMqttConfigsPublishMs = now;
+            publish_mqtt_configs();
+        }
     }
 }
+
+// ==========================================
+// ArduinoOTA Support (Over-The-Air Update)
+// ==========================================
+static bool otaInitialized = false;
+volatile bool isOtaUpdating = false;
+
+static void setup_ota() {
+    ArduinoOTA.setHostname("esp32-waterlevel");
+    ArduinoOTA.setTimeout(10000); // 10s network timeout (default is only 1s)
+
+    ArduinoOTA
+        .onStart([]() {
+            String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+            Serial.printf("\n[OTA] Start updating %s...\n", type.c_str());
+            isOtaUpdating = true;
+
+            // 1. Stop background communication tasks
+            if (commTaskHandle != NULL) {
+                vTaskSuspend(commTaskHandle);
+            }
+            if (mqttClient.connected()) {
+                mqttClient.disconnect();
+            }
+
+            BL_ON;
+            isBacklightOn = true;
+
+            set_rs485_output(pump1_io_pin, false);
+            set_rs485_output(pump2_io_pin, false);
+            set_rs485_output(valve_io_pin, false);
+
+            // 2. Suspend LVGL task safely and wait for DMA to finish
+            lvgl_port_suspend();
+            gfx.waitDMA();
+
+            // 3. Ultra-fast, clean direct draw (takes ~2ms, zero lag, no LVGL overhead)
+            gfx.fillScreen(0x0F172A);
+            gfx.fillRoundRect(80, 80, 640, 320, 16, 0x1E293B);
+            gfx.drawRoundRect(80, 80, 640, 320, 16, 0x38BDF8);
+
+            gfx.setTextDatum(textdatum_t::middle_center);
+
+            gfx.setFont(&fonts::Font4);
+            gfx.setTextColor(0xF8FAFC, 0x1E293B);
+            gfx.drawString("OTA FIRMWARE UPDATE", 400, 160);
+
+            gfx.setTextColor(0x38BDF8, 0x1E293B);
+            gfx.drawString("UPDATING... PLEASE WAIT", 400, 230);
+
+            gfx.setFont(&fonts::Font2);
+            gfx.setTextColor(0xF59E0B, 0x1E293B);
+            gfx.drawString("! DO NOT POWER OFF - WILL REBOOT AUTOMATICALLY !", 400, 310);
+        })
+        .onEnd([]() {
+            Serial.println("\n[OTA] Update Complete! Rebooting ESP32...");
+            gfx.setFont(&fonts::Font4);
+            gfx.setTextColor(0x22C55E, 0x1E293B);
+            gfx.drawString("UPDATE COMPLETE! REBOOTING...", 400, 230);
+            delay(500);
+            ESP.restart();
+        })
+        .onProgress([](unsigned int progress, unsigned int total) {
+            static unsigned int lastPct = 999;
+            unsigned int pct = (total > 0) ? (progress / (total / 100)) : 0;
+            if (pct != lastPct) {
+                lastPct = pct;
+                if (pct % 10 == 0) {
+                    Serial.printf("[OTA] Progress: %u%%\n", pct);
+                }
+            }
+        })
+        .onError([](ota_error_t error) {
+            Serial.printf("\n[OTA] Error occurred (%u)! Rebooting ESP32 immediately...\n", error);
+            delay(500);
+            ESP.restart();
+        });
+
+    ArduinoOTA.begin();
+    otaInitialized = true;
+    Serial.printf("[OTA] ArduinoOTA ready at %s (Hostname: esp32-waterlevel)\n", WiFi.localIP().toString().c_str());
+}
+
+static void handle_ota_loop() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!otaInitialized) {
+            setup_ota();
+        }
+        ArduinoOTA.handle();
+    } else {
+        otaInitialized = false;
+    }
+}
+
 
 static void setup_wifi_clock_ui() {
     lv_obj_set_style_pad_all(ui_PanelWiFiAndClock, 12, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1188,6 +2139,7 @@ static void setup_wifi_clock_ui() {
     autoBacklightSwitch = lv_switch_create(sysCard);
     lv_obj_set_pos(autoBacklightSwitch, 15, 42);
     lv_obj_set_size(autoBacklightSwitch, 42, 22);
+    lv_obj_add_event_cb(autoBacklightSwitch, auto_backlight_toggle, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t *autoBlLbl = lv_label_create(sysCard);
     lv_label_set_text(autoBlLbl, "AUTO BACKLIGHT OFF AFTER:");
@@ -1223,6 +2175,7 @@ static void setup_wifi_clock_ui() {
     autoRestartSwitch = lv_switch_create(sysCard);
     lv_obj_set_pos(autoRestartSwitch, 15, 108);
     lv_obj_set_size(autoRestartSwitch, 42, 22);
+    lv_obj_add_event_cb(autoRestartSwitch, auto_restart_toggle, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t *autoRsLbl = lv_label_create(sysCard);
     lv_label_set_text(autoRsLbl, "AUTO RESTART AFTER:");
@@ -1354,13 +2307,29 @@ static void set_textarea_number(lv_obj_t *textarea, float value, uint8_t decimal
 }
 
 static void update_settings_ui() {
-    set_textarea_number(ui_SetOnValve, waterSettings.valveOnCm, 1);
-    set_textarea_number(ui_SetTankCapacity, waterSettings.tankCapacity, 1);
-    set_textarea_number(ui_SetPeriodTimeContorl, waterSettings.valvePeriodSec, 1);
-    set_textarea_number(ui_SetPumpDelay, (float)waterSettings.pumpDelaySec);
-    set_textarea_number(ui_SetMinAlert, waterSettings.alertMinCm, 1);
-    set_textarea_number(ui_SetMaxAlert, waterSettings.alertMaxCm, 1);
-    set_textarea_number(ui_SetPeriodTimeAlert, (float)waterSettings.alertPeriodSec);
+    if (ui_SetOnValve) set_textarea_number(ui_SetOnValve, waterSettings.valveOnCm, 1);
+    if (ui_SetTankCapacity) set_textarea_number(ui_SetTankCapacity, waterSettings.tankCapacity, 1);
+    if (ui_SetPeriodTimeContorl) set_textarea_number(ui_SetPeriodTimeContorl, waterSettings.valvePeriodSec, 1);
+    if (ui_SetMinAlert) set_textarea_number(ui_SetMinAlert, waterSettings.alertMinCm, 1);
+    if (ui_SetMaxAlert) set_textarea_number(ui_SetMaxAlert, waterSettings.alertMaxCm, 1);
+    if (ui_SetPeriodTimeAlert) set_textarea_number(ui_SetPeriodTimeAlert, (float)waterSettings.alertPeriodSec);
+    if (ui_SetLowerLimit) set_textarea_number(ui_SetLowerLimit, waterSettings.lowerLimitCm, 1);
+
+    // Inverter PID textareas (ui_PanelAuto)
+    if (ui_SetPidKp) set_textarea_number(ui_SetPidKp, waterSettings.pidKp, 2);
+    if (ui_SetPidKi) set_textarea_number(ui_SetPidKi, waterSettings.pidKi, 2);
+    if (ui_SetPressure) set_textarea_number(ui_SetPressure, waterSettings.setPressure, 2);
+    if (ui_SetSleepFreq) set_textarea_number(ui_SetSleepFreq, waterSettings.sleepFreq, 1);
+    if (ui_SetSleepDelay) set_textarea_number(ui_SetSleepDelay, (float)waterSettings.sleepDelaySec, 0);
+
+    // Inverter Manual textareas (ui_PanelManual)
+    if (ui_SetSpeedPump1) set_textarea_number(ui_SetSpeedPump1, waterSettings.manualSpeedPump1, 1);
+    if (ui_SetSpeedPump2) set_textarea_number(ui_SetSpeedPump2, waterSettings.manualSpeedPump2, 1);
+    if (ui_SetAccDec) set_textarea_number(ui_SetAccDec, waterSettings.accDec, 1);
+
+    if (ui_SwitchSensorType)
+        lv_obj_set_state(ui_SwitchSensorType, LV_STATE_CHECKED, waterSettings.sensorTypeSwitch);
+
     if (ui_LabelLimits) {
         char limits[64];
         snprintf(limits, sizeof(limits), "ALERT MIN: %.1f cm | MAX: %.1f cm", waterSettings.alertMinCm, waterSettings.alertMaxCm);
@@ -1375,66 +2344,135 @@ static float configuredLevelMaxCm() {
 static void update_mode_ui() {
     if (ui_ManualAuto)
         lv_obj_set_state(ui_ManualAuto, LV_STATE_CHECKED, waterSettings.autoMode);
-    if (ui_AutoPump1)
-        lv_obj_set_state(ui_AutoPump1, LV_STATE_CHECKED, waterSettings.autoPump1);
-    if (ui_AutoPump2)
-        lv_obj_set_state(ui_AutoPump2, LV_STATE_CHECKED, waterSettings.autoPump2);
-    const bool autoMode = waterSettings.autoMode;
-    for (lv_obj_t *obj : {ui_ManualPump1, ui_ManualPump2, ui_ManualValve}) {
-        if (!obj) continue;
-        if (autoMode) lv_obj_add_state(obj, LV_STATE_DISABLED);
-        else lv_obj_clear_state(obj, LV_STATE_DISABLED);
+    if (ui_SwitchAutoPump1)
+        lv_obj_set_state(ui_SwitchAutoPump1, LV_STATE_CHECKED, waterSettings.autoPump1);
+    if (ui_SwitchAutoPump2)
+        lv_obj_set_state(ui_SwitchAutoPump2, LV_STATE_CHECKED, waterSettings.autoPump2);
+    if (ui_SwitchSensorType)
+        lv_obj_set_state(ui_SwitchSensorType, LV_STATE_CHECKED, waterSettings.sensorTypeSwitch);
+
+    if (waterSettings.autoMode) {
+        waterSettings.manualPump1 = false;
+        waterSettings.manualPump2 = false;
+        waterSettings.manualValve = false;
+        manualValveOverride = false;
     }
-    if (!autoMode) {
-        if (ui_ManualPump1) lv_obj_set_state(ui_ManualPump1, LV_STATE_CHECKED, waterSettings.manualPump1);
-        if (ui_ManualPump2) lv_obj_set_state(ui_ManualPump2, LV_STATE_CHECKED, waterSettings.manualPump2);
-        if (ui_ManualValve) lv_obj_set_state(ui_ManualValve, LV_STATE_CHECKED, waterSettings.manualValve);
-        set_rs485_output(1, waterSettings.manualPump1);
-        set_rs485_output(2, waterSettings.manualPump2);
-        set_rs485_output(0, waterSettings.manualValve);
-        manualValveOverride = waterSettings.manualValve;
-    }
+
+    auto apply_manual_switch_state = [](lv_obj_t *sw, bool checked, bool disabled) {
+        if (!sw) return;
+        lv_obj_set_state(sw, LV_STATE_CHECKED, checked);
+        if (disabled) {
+            lv_obj_add_state(sw, LV_STATE_DISABLED);
+            lv_obj_remove_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_remove_state(sw, LV_STATE_DISABLED);
+            lv_obj_add_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+        }
+    };
+
+    apply_manual_switch_state(ui_SwitchManualPump1, waterSettings.manualPump1, waterSettings.autoMode);
+    apply_manual_switch_state(ui_SwitchManualPump2, waterSettings.manualPump2, waterSettings.autoMode);
+    apply_manual_switch_state(ui_SwitchValve, waterSettings.manualValve, waterSettings.autoMode);
+
+    if (ui_SetLowerLimit)
+        set_textarea_number(ui_SetLowerLimit, waterSettings.lowerLimitCm, 1);
+    if (ui_SetSpeedPump1)
+        set_textarea_number(ui_SetSpeedPump1, waterSettings.manualSpeedPump1, 1);
+    if (ui_SetSpeedPump2)
+        set_textarea_number(ui_SetSpeedPump2, waterSettings.manualSpeedPump2, 1);
+    if (ui_SetAccDec)
+        set_textarea_number(ui_SetAccDec, waterSettings.accDec, 1);
 }
 
 static void save_settings_from_ui(lv_event_t *) {
-    waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
-    // Tank capacity is the source of truth for every level limit.
     const float maxLevelCm = configuredLevelMaxCm();
-    waterSettings.valveOnCm = boundedFloat(lv_textarea_get_text(ui_SetOnValve), waterSettings.valveOnCm, 0.0f, maxLevelCm);
-    waterSettings.valvePeriodSec = boundedFloat(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 0.1f, 86400.0f);
-    waterSettings.pumpDelaySec = boundedUint(lv_textarea_get_text(ui_SetPumpDelay), waterSettings.pumpDelaySec, 0, 86400);
-    waterSettings.alertMinCm = boundedFloat(lv_textarea_get_text(ui_SetMinAlert), waterSettings.alertMinCm, 0.0f, maxLevelCm);
-    waterSettings.alertMaxCm = boundedFloat(lv_textarea_get_text(ui_SetMaxAlert), waterSettings.alertMaxCm, 0.0f, maxLevelCm);
-    waterSettings.alertPeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeAlert), waterSettings.alertPeriodSec, 1, 86400);
+    if (ui_SetTankCapacity)
+        waterSettings.tankCapacity = boundedFloat(lv_textarea_get_text(ui_SetTankCapacity), waterSettings.tankCapacity, 0.1f, 1000000.0f);
+    if (ui_SetOnValve)
+        waterSettings.valveOnCm = boundedFloat(lv_textarea_get_text(ui_SetOnValve), waterSettings.valveOnCm, 0.0f, maxLevelCm);
+    if (ui_SetPeriodTimeContorl)
+        waterSettings.valvePeriodSec = boundedFloat(lv_textarea_get_text(ui_SetPeriodTimeContorl), waterSettings.valvePeriodSec, 0.1f, 86400.0f);
+    if (ui_SetMinAlert)
+        waterSettings.alertMinCm = boundedFloat(lv_textarea_get_text(ui_SetMinAlert), waterSettings.alertMinCm, 0.0f, maxLevelCm);
+    if (ui_SetMaxAlert)
+        waterSettings.alertMaxCm = boundedFloat(lv_textarea_get_text(ui_SetMaxAlert), waterSettings.alertMaxCm, 0.0f, maxLevelCm);
+    if (ui_SetPeriodTimeAlert)
+        waterSettings.alertPeriodSec = boundedUint(lv_textarea_get_text(ui_SetPeriodTimeAlert), waterSettings.alertPeriodSec, 1, 86400);
+    if (ui_SetLowerLimit)
+        waterSettings.lowerLimitCm = boundedFloat(lv_textarea_get_text(ui_SetLowerLimit), waterSettings.lowerLimitCm, 0.0f, maxLevelCm);
+
+    // Inverter PID settings (ui_PanelAuto)
+    if (ui_SetPidKp)
+        waterSettings.pidKp = boundedFloat(lv_textarea_get_text(ui_SetPidKp), waterSettings.pidKp, 0.0f, 100.0f);
+    if (ui_SetPidKi)
+        waterSettings.pidKi = boundedFloat(lv_textarea_get_text(ui_SetPidKi), waterSettings.pidKi, 0.0f, 100.0f);
+    if (ui_SetPressure)
+        waterSettings.setPressure = boundedFloat(lv_textarea_get_text(ui_SetPressure), waterSettings.setPressure, 0.0f, 6.0f);
+    if (ui_SetSleepFreq) {
+        waterSettings.sleepFreq = boundedFloat(lv_textarea_get_text(ui_SetSleepFreq), waterSettings.sleepFreq, 0.0f, 50.0f);
+        if (waterSettings.manualSpeedPump1 < waterSettings.sleepFreq) waterSettings.manualSpeedPump1 = waterSettings.sleepFreq;
+        if (waterSettings.manualSpeedPump2 < waterSettings.sleepFreq) waterSettings.manualSpeedPump2 = waterSettings.sleepFreq;
+    }
+    if (ui_SetSleepDelay)
+        waterSettings.sleepDelaySec = boundedUint(lv_textarea_get_text(ui_SetSleepDelay), waterSettings.sleepDelaySec, 0, 3600);
+
+    // Inverter Manual settings (ui_PanelManual)
+    if (ui_SetSpeedPump1)
+        waterSettings.manualSpeedPump1 = boundedFloat(lv_textarea_get_text(ui_SetSpeedPump1), waterSettings.manualSpeedPump1, waterSettings.sleepFreq, 50.0f);
+    if (ui_SetSpeedPump2)
+        waterSettings.manualSpeedPump2 = boundedFloat(lv_textarea_get_text(ui_SetSpeedPump2), waterSettings.manualSpeedPump2, waterSettings.sleepFreq, 50.0f);
+    if (ui_SetAccDec)
+        waterSettings.accDec = boundedFloat(lv_textarea_get_text(ui_SetAccDec), waterSettings.accDec, 0.1f, 3600.0f);
 
     if (waterSettings.alertMinCm >= waterSettings.alertMaxCm)
         waterSettings.alertMaxCm = min(maxLevelCm, waterSettings.alertMinCm + 1.0f);
+
     update_settings_ui();
     save_water_settings();
 }
 
+static void sensor_type_event(lv_event_t *e) {
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+    waterSettings.sensorTypeSwitch = lv_obj_has_state(obj, LV_STATE_CHECKED);
+    save_water_settings();
+    update_manual_leds(true);
+}
+
 static void save_mode_settings(lv_event_t *) {
-    const bool prevAuto = waterSettings.autoMode;
-    waterSettings.autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
-    waterSettings.autoPump1 = ui_AutoPump1 && lv_obj_has_state(ui_AutoPump1, LV_STATE_CHECKED);
-    waterSettings.autoPump2 = ui_AutoPump2 && lv_obj_has_state(ui_AutoPump2, LV_STATE_CHECKED);
+    if (ui_ManualAuto)
+        waterSettings.autoMode = lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
+    if (ui_SwitchAutoPump1)
+        waterSettings.autoPump1 = lv_obj_has_state(ui_SwitchAutoPump1, LV_STATE_CHECKED);
+    if (ui_SwitchAutoPump2)
+        waterSettings.autoPump2 = lv_obj_has_state(ui_SwitchAutoPump2, LV_STATE_CHECKED);
+    if (ui_SwitchSensorType)
+        waterSettings.sensorTypeSwitch = lv_obj_has_state(ui_SwitchSensorType, LV_STATE_CHECKED);
+
     if (waterSettings.autoMode) {
+        waterSettings.manualPump1 = false;
+        waterSettings.manualPump2 = false;
+        waterSettings.manualValve = false;
         manualValveOverride = false;
-    } else if (prevAuto) {
-        if (ui_ManualPump1) lv_obj_set_state(ui_ManualPump1, LV_STATE_CHECKED, waterSettings.manualPump1);
-        if (ui_ManualPump2) lv_obj_set_state(ui_ManualPump2, LV_STATE_CHECKED, waterSettings.manualPump2);
-        if (ui_ManualValve) lv_obj_set_state(ui_ManualValve, LV_STATE_CHECKED, waterSettings.manualValve);
-        set_rs485_output(1, waterSettings.manualPump1);
-        set_rs485_output(2, waterSettings.manualPump2);
-        set_rs485_output(0, waterSettings.manualValve);
+        set_rs485_output(valve_io_pin, false);
+    } else {
+        if (ui_SwitchManualPump1)
+            waterSettings.manualPump1 = lv_obj_has_state(ui_SwitchManualPump1, LV_STATE_CHECKED);
+        if (ui_SwitchManualPump2)
+            waterSettings.manualPump2 = lv_obj_has_state(ui_SwitchManualPump2, LV_STATE_CHECKED);
+        if (ui_SwitchValve)
+            waterSettings.manualValve = lv_obj_has_state(ui_SwitchValve, LV_STATE_CHECKED);
+        set_rs485_output(valve_io_pin, waterSettings.manualValve);
         manualValveOverride = waterSettings.manualValve;
     }
-    for (lv_obj_t *obj : {ui_ManualPump1, ui_ManualPump2, ui_ManualValve}) {
-        if (!obj) continue;
-        if (waterSettings.autoMode) lv_obj_add_state(obj, LV_STATE_DISABLED);
-        else lv_obj_clear_state(obj, LV_STATE_DISABLED);
+
+    if (ui_SetLowerLimit) {
+        const float maxLevelCm = configuredLevelMaxCm();
+        waterSettings.lowerLimitCm = boundedFloat(lv_textarea_get_text(ui_SetLowerLimit), waterSettings.lowerLimitCm, 0.0f, maxLevelCm);
     }
+
     save_water_settings();
+    update_mode_ui();
+    update_manual_leds(true);
 }
 
 // The SquareLine keyboard is a shared numeric keypad for all setting fields.
@@ -1578,7 +2616,9 @@ static void pollRs485Io() {
     // read-coils response is not reliable. Do not use function 0x01 as a
     // reconnect test because it creates a false disconnect/reconnect loop.
     shared_rs485_inputs = (uint8_t)(rs485Io.getResponseBuffer(0) & 0xFF);
-    shared_pressure_switch = (shared_rs485_inputs & (1u << 1)) != 0; // DI address 1
+    shared_pressure_switch = (shared_rs485_inputs & (1u << pressure_switch_io_pin)) != 0;
+    shared_pump1_overload = (shared_rs485_inputs & (1u << pump1_overload_io_pin)) != 0;
+    shared_pump2_overload = (shared_rs485_inputs & (1u << pump2_overload_io_pin)) != 0;
 
     // Outputs are controlled only by the local shadow updated from the UI.
     // On the first connection or after reconnect, resend the latest UI state
@@ -1665,6 +2705,113 @@ void doModbusScan() {
     logMsg("============================================\n");
 }
 
+static void modbus_idle_yield() {
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+// -----------------------------------------------------------------------------
+// OMRON SYSDRIVE 3G3JZ Inverter & Pressure Modbus RTU Routines (Core 0)
+// -----------------------------------------------------------------------------
+static void sendInverterCmd(uint8_t slaveId, bool run, float targetFreq) {
+    modbus.begin(slaveId, Serial1);
+    modbus.idle(modbus_idle_yield);
+    WS43B.rs485.clearRxBuffer();
+
+    // Frequency command register 0x2102 (scale: 0.01 Hz)
+    uint16_t fVal = (uint16_t)constrain((int)(targetFreq * 100.0f + 0.5f), 0, 5000);
+    uint8_t res = modbus.writeSingleRegister(0x2102, fVal);
+
+    if (res == modbus.ku8MBSuccess) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        WS43B.rs485.clearRxBuffer();
+
+        // Control command register 0x2101 (Bit 5 ComCtrl, Bit 4 ComRef, Bit 0 Run)
+        uint16_t ctrlVal = run ? 0x0031 : 0x0030;
+        modbus.writeSingleRegister(0x2101, ctrlVal);
+    }
+}
+
+static bool sendInverterAccDec(uint8_t slaveId, float accDecSec) {
+    modbus.begin(slaveId, Serial1);
+    modbus.idle(modbus_idle_yield);
+    WS43B.rs485.clearRxBuffer();
+
+    // Omron 3G3JZ: n1.09 (0x0109) = Accel Time 1, n1.10 (0x010A) = Decel Time 1
+    // Range: 0.1s to 600.0s, scale: 0.1s -> value 1 to 6000
+    uint16_t rawVal = (uint16_t)constrain((int)(accDecSec * 10.0f + 0.5f), 1, 6000);
+
+    // 1. Write Acceleration Time 1 (0x0109)
+    uint8_t res1 = modbus.writeSingleRegister(0x0109, rawVal);
+    vTaskDelay(pdMS_TO_TICKS(8));
+    WS43B.rs485.clearRxBuffer();
+
+    // 2. Write Deceleration Time 1 (0x010A)
+    uint8_t res2 = modbus.writeSingleRegister(0x010A, rawVal);
+
+    if (res1 == modbus.ku8MBSuccess && res2 == modbus.ku8MBSuccess) {
+        Serial.printf("[INV ID %d] Acc/Dec updated: %.1fs (raw: %u)\n", slaveId, accDecSec, rawVal);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static void pollInverter(uint8_t slaveId, volatile float &outFreq, volatile float &outCurr,
+                         volatile uint16_t &outStatus, volatile bool &outRunning,
+                         volatile bool &outAlarm, volatile bool &modbusOk) {
+    modbus.begin(slaveId, Serial1);
+    modbus.idle(modbus_idle_yield);
+    WS43B.rs485.clearRxBuffer();
+
+    // Read 0x2120 - 0x2121 (Status bit and Error code)
+    uint8_t res = modbus.readHoldingRegisters(0x2120, 2);
+    if (res == modbus.ku8MBSuccess) {
+        modbusOk = true;
+        uint16_t st = modbus.getResponseBuffer(0);
+        outStatus = st;
+        outRunning = (st & 0x0001) != 0;
+        outAlarm = (st & 0x0018) != 0; // Bit 3 (Trip) or Bit 4 (Alarm)
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+        WS43B.rs485.clearRxBuffer();
+
+        // Read 0x2124 - 0x2126 (Output Frequency, Voltage, Current)
+        res = modbus.readHoldingRegisters(0x2124, 3);
+        if (res == modbus.ku8MBSuccess) {
+            uint16_t rawF = modbus.getResponseBuffer(0);
+            uint16_t rawC = modbus.getResponseBuffer(2);
+            outFreq = (rawF > 600) ? ((float)rawF / 100.0f) : ((float)rawF / 10.0f);
+            outCurr = (rawC > 300) ? ((float)rawC / 100.0f) : ((float)rawC / 10.0f);
+        }
+    } else {
+        modbusOk = false;
+        outRunning = false;
+    }
+}
+
+static void pollPressureSensor() {
+    modbus.begin(PRESSURE_SLAVE_ID, Serial1);
+    modbus.idle(modbus_idle_yield);
+    WS43B.rs485.clearRxBuffer();
+
+    uint8_t result = modbus.readHoldingRegisters(PRESSURE_START_REG, 1);
+    if (result == modbus.ku8MBIllegalFunction) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        WS43B.rs485.clearRxBuffer();
+        result = modbus.readInputRegisters(PRESSURE_START_REG, 1);
+    }
+
+    if (result == modbus.ku8MBSuccess) {
+        pressure_sensor_ok = true;
+        uint16_t raw = modbus.getResponseBuffer(0);
+        // ID6, Reg 0, 0 - 6.00 bar:
+        float p = (raw > 600) ? ((float)raw / 1000.0f) : ((float)raw / 100.0f);
+        shared_pressure_bar = p;
+    } else {
+        pressure_sensor_ok = false;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Core 0 Dedicated Communication Task
 // -----------------------------------------------------------------------------
@@ -1678,19 +2825,28 @@ void commTask(void *param) {
     uint8_t local_last_di0 = 0xFF;
     uint8_t local_last_di1 = 0xFF;
 
+    // Inverter PID controller states
+    float pidIntegral = 0.0f;
+    uint32_t sleepStartTime = 0;
+    bool inSleep = false;
+    unsigned long lastPressurePollTime = 0;
+    unsigned long lastInverterPollTime = 0;
+    unsigned long lastPidComputeTime = millis();
+    bool lastP1Run = false;
+    float lastP1Freq = -1.0f;
+    bool lastP2Run = false;
+    float lastP2Freq = -1.0f;
+
     while (true) {
         // 1. ส่งสถานะ output เมื่อมีการเปลี่ยนแปลง หรือครั้งแรกหลังเชื่อมต่อ
         if (rs485_output_synced && pendingIoMask != 0) {
             pendingIoMask = 0;
             rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
-            // The IO module requires all eight outputs in one transaction.
-            // ModbusMaster packs coil states from transmit buffer word 0.
             rs485Io.setTransmitBuffer(0, shared_rs485_outputs & 0xFF);
             const uint8_t result = rs485Io.writeMultipleCoils(0, 8); // 0x0F, coils 0..7
             if (result == rs485Io.ku8MBSuccess)
                 rs485_io_ok = true;
             else {
-                // Retry after the DI poll confirms the link is available.
                 pendingIoMask = 0xFF;
                 rs485_io_ok = false;
             }
@@ -1703,7 +2859,198 @@ void commTask(void *param) {
             lastPollTime = millis();
         }
 
-        // 3. รอบอ่านค่า Modbus อัตโนมัติตามรอบเวลา
+        // 3. อ่านค่า Pressure Transmitter (Slave ID 6, Reg 0)
+        const uint32_t pressPollInterval = pressure_sensor_ok ? DEFAULT_PRESSURE_POLL_MS : 1000;
+        if (millis() - lastPressurePollTime >= pressPollInterval) {
+            lastPressurePollTime = millis();
+            pollPressureSensor();
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        // 4. Inverter PID & Sleep Controller Logic (คำนวณและสั่งงานทุก 200ms)
+        if (millis() - lastPidComputeTime >= 200) {
+            const float dt = (millis() - lastPidComputeTime) / 1000.0f;
+            lastPidComputeTime = millis();
+
+            // ตรวจสอบระดับน้ำต่ำกว่า lowerLimit หรือไม่ (Protection)
+            float levelCm = (float)shared_reg0 / 10.0f;
+            bool levelOk = (levelCm >= waterSettings.lowerLimitCm);
+
+            bool p1TargetRun = false;
+            float p1TargetFreq = 0.0f;
+            bool p2TargetRun = false;
+            float p2TargetFreq = 0.0f;
+
+            if (waterSettings.autoMode) {
+                if (!levelOk) {
+                    // น้ำในถังต่ำกว่า Lower Limit -> สั่งตัดปั๊มในโหมด auto เพื่อความปลอดภัย
+                    inSleep = false;
+                    sleepStartTime = 0;
+                    p1TargetRun = false;
+                    p2TargetRun = false;
+                    shared_pid_target_freq = 0.0f;
+                    shared_is_sleeping = false;
+                } else if (waterSettings.sensorTypeSwitch) {
+                    // --- AUTO MODE with PRESSURE SWITCH (จาก pressure_switch_io_pin) ---
+                    inSleep = false;
+                    sleepStartTime = 0;
+                    shared_is_sleeping = false;
+
+                    if (shared_pressure_switch) {
+                        // Pressure switch ON (แรงดันตก/สั่งปั๊มทำงาน) -> Run pumps
+                        float spd1 = constrain(waterSettings.manualSpeedPump1, waterSettings.sleepFreq, 50.0f);
+                        float spd2 = constrain(waterSettings.manualSpeedPump2, waterSettings.sleepFreq, 50.0f);
+                        shared_pid_target_freq = max(spd1, spd2);
+
+                        if (waterSettings.autoPump1 && !shared_pump1_alarm) {
+                            p1TargetRun = true;
+                            p1TargetFreq = spd1;
+                        }
+                        if (waterSettings.autoPump2 && !shared_pump2_alarm) {
+                            p2TargetRun = true;
+                            p2TargetFreq = spd2;
+                        }
+                    } else {
+                        // Pressure switch OFF (แรงดันได้ที่แล้ว) -> หยุดปั๊ม
+                        p1TargetRun = false;
+                        p1TargetFreq = 0.0f;
+                        p2TargetRun = false;
+                        p2TargetFreq = 0.0f;
+                        shared_pid_target_freq = 0.0f;
+                    }
+                } else {
+                    // --- AUTO PID MODE with RS485 SENSOR (Slave ID 6) ---
+                    const float sp = waterSettings.setPressure;
+                    const float pv = shared_pressure_bar;
+                    const float err = sp - pv;
+
+                    const float pTerm = waterSettings.pidKp * err;
+                    pidIntegral += waterSettings.pidKi * err * dt;
+                    pidIntegral = constrain(pidIntegral, 0.0f, 50.0f);
+
+                    float rawCalc = pTerm + pidIntegral;
+
+                    // ตรวจสอบเงื่อนไข Sleep: ความถี่ลงมาที่หรือต่ำกว่า SetSleepFreq เป็นเวลาที่กำหนดใน SetSleepDelay
+                    if (rawCalc <= waterSettings.sleepFreq) {
+                        if (sleepStartTime == 0) sleepStartTime = millis();
+                        if (millis() - sleepStartTime >= (uint32_t)(waterSettings.sleepDelaySec * 1000UL)) {
+                            inSleep = true;
+                        }
+                    } else {
+                        sleepStartTime = 0;
+                    }
+
+                    // ตรวจสอบเงื่อนไข Wake-up: เมื่อแรงดันตกต่ำกว่า Setpoint (ต่ำกว่า 0.30 bar) ให้ตื่นขึ้นมาทำงานใหม่
+                    if (inSleep) {
+                        if (pv <= (sp - 0.30f)) {
+                            inSleep = false;
+                            sleepStartTime = 0;
+                            pidIntegral = waterSettings.sleepFreq; // เริ่มต้นนุ่มนวล
+                            rawCalc = waterSettings.sleepFreq;
+                        }
+                    }
+
+                    float finalFreq = 0.0f;
+                    if (inSleep) {
+                        finalFreq = 0.0f;
+                    } else {
+                        // SetSleepFreq จะควบคุม ความเร็วต่ำสุดด้วย, ค่า max 50Hz
+                        finalFreq = constrain(rawCalc, waterSettings.sleepFreq, 50.0f);
+                    }
+
+                    shared_pid_target_freq = finalFreq;
+                    shared_is_sleeping = inSleep;
+
+                    if (!inSleep && finalFreq >= 1.0f) {
+                        if (waterSettings.autoPump1 && !shared_pump1_alarm) {
+                            p1TargetRun = true;
+                            p1TargetFreq = finalFreq;
+                        }
+                        if (waterSettings.autoPump2 && !shared_pump2_alarm) {
+                            p2TargetRun = true;
+                            p2TargetFreq = finalFreq;
+                        }
+                    }
+                }
+            } else {
+                // --- MANUAL MODE ---
+                inSleep = false;
+                sleepStartTime = 0;
+                shared_is_sleeping = false;
+                shared_pid_target_freq = 0.0f;
+
+                // SetSpeedPump1, SetSpeedPump2 สำหรับตั้ง speed เป็น Hz ค่า min กำหนดตามค่า SetSleepFreq ค่า max 50Hz
+                float spd1 = constrain(waterSettings.manualSpeedPump1, waterSettings.sleepFreq, 50.0f);
+                float spd2 = constrain(waterSettings.manualSpeedPump2, waterSettings.sleepFreq, 50.0f);
+
+                if (waterSettings.manualPump1 && !shared_pump1_alarm) {
+                    p1TargetRun = true;
+                    p1TargetFreq = spd1;
+                }
+                if (waterSettings.manualPump2 && !shared_pump2_alarm) {
+                    p2TargetRun = true;
+                    p2TargetFreq = spd2;
+                }
+            }
+
+            // ส่งคำสั่งไปยัง Inverter เมื่อสถานะเปลี่ยน หรือส่งย้ำทุก 3 วินาทีเฉพาะตอนที่ปั๊มกำลัง Run
+            static uint32_t lastCmdSendTime = 0;
+            const bool stateChanged = (p1TargetRun != lastP1Run || abs(p1TargetFreq - lastP1Freq) > 0.2f ||
+                                       p2TargetRun != lastP2Run || abs(p2TargetFreq - lastP2Freq) > 0.2f);
+            const bool periodicRefresh = (p1TargetRun || p2TargetRun) && (millis() - lastCmdSendTime >= 3000);
+            if (stateChanged || periodicRefresh) {
+                lastCmdSendTime = millis();
+                lastP1Run = p1TargetRun;
+                lastP1Freq = p1TargetFreq;
+                lastP2Run = p2TargetRun;
+                lastP2Freq = p2TargetFreq;
+
+                if (p1TargetRun || stateChanged) {
+                    sendInverterCmd(INVERTER_PUMP1_SLAVE_ID, p1TargetRun, p1TargetFreq);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                if (p2TargetRun || stateChanged) {
+                    sendInverterCmd(INVERTER_PUMP2_SLAVE_ID, p2TargetRun, p2TargetFreq);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+
+            // ส่งค่า Acc/Dec ไปยัง Inverter เมื่อค่ามีการเปลี่ยนแปลง หรือเมื่อเริ่มต้น
+            static float lastSentAccDecP1 = -1.0f;
+            static float lastSentAccDecP2 = -1.0f;
+            static uint32_t lastAccDecRetryTime = 0;
+            const float currentAccDec = constrain(waterSettings.accDec, 0.1f, 600.0f);
+
+            if (millis() - lastAccDecRetryTime >= 2000) {
+                lastAccDecRetryTime = millis();
+                if (abs(currentAccDec - lastSentAccDecP1) > 0.05f) {
+                    if (sendInverterAccDec(INVERTER_PUMP1_SLAVE_ID, currentAccDec)) {
+                        lastSentAccDecP1 = currentAccDec;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                if (abs(currentAccDec - lastSentAccDecP2) > 0.05f) {
+                    if (sendInverterAccDec(INVERTER_PUMP2_SLAVE_ID, currentAccDec)) {
+                        lastSentAccDecP2 = currentAccDec;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+        }
+
+        // 5. อ่านสถานะ Inverter 1 & Inverter 2
+        const uint32_t invPollInterval = (pump1_modbus_ok || pump2_modbus_ok) ? DEFAULT_INVERTER_POLL_MS : 1200;
+        if (millis() - lastInverterPollTime >= invPollInterval) {
+            lastInverterPollTime = millis();
+            pollInverter(INVERTER_PUMP1_SLAVE_ID, shared_pump1_freq, shared_pump1_current,
+                         shared_pump1_status, shared_pump1_running, shared_pump1_alarm, pump1_modbus_ok);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            pollInverter(INVERTER_PUMP2_SLAVE_ID, shared_pump2_freq, shared_pump2_current,
+                         shared_pump2_status, shared_pump2_running, shared_pump2_alarm, pump2_modbus_ok);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // 6. รอบอ่านค่า Water Level Sensor ตามรอบเวลา
 #if !WATER_LEVEL_SIMULATION && WATER_LEVEL_SENSOR_PRESENT
         const uint32_t sensorPollInterval = MODBUS_POLL_MS;
         if (millis() - lastPollTime >= sensorPollInterval) {
@@ -1724,7 +3071,7 @@ void commTask(void *param) {
             pollRs485Io();
         }
 
-        // 4. รับและประมวลผลเฟรม CAN Bus (TWAI)
+        // 7. รับและประมวลผลเฟรม CAN Bus (TWAI)
         twai_message_t canRx;
         if (WS43B.can.receiveMessage(canRx, 2)) {
             char cbuf[128];
@@ -1736,7 +3083,7 @@ void commTask(void *param) {
             logMsg(cbuf);
         }
 
-        // 5. ตรวจสอบ Digital Inputs จาก CH422G (อ่านทุก 100ms เพื่อไม่แย่ง I2C bus กับทัชสกรีน)
+        // 8. ตรวจสอบ Digital Inputs จาก CH422G (อ่านทุก 100ms เพื่อไม่แย่ง I2C bus กับทัชสกรีน)
         if (millis() - lastDIPollTime >= 100) {
             lastDIPollTime = millis();
             uint8_t inputs = EX_Read_All();
@@ -1835,30 +3182,31 @@ static void set_rs485_output(uint8_t coil, bool on) {
     pendingIoMask |= mask;
 }
 
-static void update_auto_pumps_from_pressure() {
-    static uint32_t pressureSince = 0;
-    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
-    if (!autoMode) {
-        pressureSince = 0;
-        return;
+static float get_current_level_cm() {
+#if WATER_LEVEL_SIMULATION
+    return (simulatedLevelPct / 100.0f) * configuredLevelMaxCm();
+#else
+    return (float)shared_reg0 / 10.0f;
+#endif
+}
+
+static float get_lower_limit_cm() {
+    float limit = waterSettings.lowerLimitCm;
+    if (ui_SetLowerLimit) {
+        const char *text = lv_textarea_get_text(ui_SetLowerLimit);
+        if (text && *text) {
+            char *end = nullptr;
+            const float val = strtof(text, &end);
+            if (end != text && isfinite(val)) {
+                limit = val;
+            }
+        }
     }
+    return limit;
+}
 
-    if (!shared_pressure_switch) {
-        pressureSince = 0;
-        set_rs485_output(1, false);
-        set_rs485_output(2, false);
-        return;
-    }
-
-    if (pressureSince == 0)
-        pressureSince = millis();
-    const bool delayElapsed = millis() - pressureSince >= waterSettings.pumpDelaySec * 1000UL;
-
-    // Pressure switch DI address 1 is the single source of truth for Auto
-    // pump requests. The output shadow is updated immediately and the comm
-    // task sends all eight coils in one 0x0F transaction.
-    set_rs485_output(1, delayElapsed && waterSettings.autoPump1);
-    set_rs485_output(2, delayElapsed && waterSettings.autoPump2);
+static void update_auto_pumps_from_pressure(float levelCm) {
+    // Inverter PID and sleep control is managed on Core 0 in commTask()
 }
 
 static bool update_automatic_outputs(float levelCm) {
@@ -1887,11 +3235,12 @@ static bool update_automatic_outputs(float levelCm) {
         } else {
             valveHighSince = 0;
         }
-        set_rs485_output(0, valveOn); // RS485 coil 0 is the water valve.
-        update_auto_pumps_from_pressure();
+        set_rs485_output(valve_io_pin, valveOn);
     } else if (!autoMode) {
-        valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
+        valveOn = (shared_rs485_outputs & (1u << valve_io_pin)) != 0;
     }
+
+    update_auto_pumps_from_pressure(levelCm);
 
     const bool lowCondition = levelCm <= waterSettings.alertMinCm;
     const bool highCondition = levelCm >= waterSettings.alertMaxCm;
@@ -1912,17 +3261,44 @@ static bool update_automatic_outputs(float levelCm) {
     const bool timedOut = (alertLowSince != 0 && now - alertLowSince >= requiredMs) ||
                           (alertHighSince != 0 && now - alertHighSince >= requiredMs);
     alertOutputOn = timedOut;
-    set_rs485_output(3, alertOutputOn); // RS485 coil 3 is the alarm output.
+    set_rs485_output(alarm_io_pin, alertOutputOn);
     return valveOn;
 }
 
-static void update_manual_leds(bool force = false) {
+static void set_pump_led(lv_obj_t *led, bool running, bool alarm) {
+    if (!led)
+        return;
+    if (alarm) {
+        lv_obj_set_style_bg_opa(led, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(led, lv_color_hex(0xF97316), LV_PART_MAIN | LV_STATE_DEFAULT); // Orange (Inverter alarm/trip)
+        lv_obj_set_style_shadow_color(led, lv_color_hex(0xF97316), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_width(led, 16, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(led, LV_OPA_60, LV_PART_MAIN | LV_STATE_DEFAULT);
+    } else if (running) {
+        lv_obj_set_style_bg_opa(led, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(led, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT); // Green
+        lv_obj_set_style_shadow_color(led, lv_color_hex(0x22C55E), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_width(led, 16, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(led, LV_OPA_60, LV_PART_MAIN | LV_STATE_DEFAULT);
+    } else {
+        lv_obj_set_style_bg_opa(led, 50, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(led, lv_color_hex(0x3F0F16), LV_PART_MAIN | LV_STATE_DEFAULT); // Dark / Off
+        lv_obj_set_style_shadow_color(led, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_width(led, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(led, LV_OPA_0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+static void update_manual_leds(bool force) {
     const bool localDo0On = DO_Read(DO0) == 0;
     const bool localDo1On = DO_Read(DO1) == 0;
 
     static bool prev_meter485 = false;
     static bool prev_level485 = false;
     static bool prev_io485 = false;
+    static bool prev_pump1_mb = false;
+    static bool prev_pump2_mb = false;
+    static bool prev_press_mb = false;
     static uint8_t prev_outputs = 0xFF;
     static uint8_t prev_inputs = 0xFF;
     static bool prev_di0 = false;
@@ -1930,63 +3306,131 @@ static void update_manual_leds(bool force = false) {
     static bool prev_do0 = false;
     static bool prev_do1 = false;
 
-    if (!force &&
-        prev_meter485 == lastRs485Ok &&
-        prev_level485 == lastRs485Ok &&
-        prev_io485 == rs485_io_ok &&
-        prev_outputs == shared_rs485_outputs &&
-        prev_inputs == shared_rs485_inputs &&
-        prev_di0 == shared_di0 &&
-        prev_di1 == shared_di1 &&
-        prev_do0 == localDo0On &&
-        prev_do1 == localDo1On) {
-        return;
+    bool ioChanged = force ||
+                     (prev_meter485 != water_meter_ok) ||
+                     (prev_level485 != lastRs485Ok) ||
+                     (prev_io485 != rs485_io_ok) ||
+                     (prev_pump1_mb != pump1_modbus_ok) ||
+                     (prev_pump2_mb != pump2_modbus_ok) ||
+                     (prev_press_mb != pressure_sensor_ok) ||
+                     (prev_outputs != shared_rs485_outputs) ||
+                     (prev_inputs != shared_rs485_inputs) ||
+                     (prev_di0 != shared_di0) ||
+                     (prev_di1 != shared_di1) ||
+                     (prev_do0 != localDo0On) ||
+                     (prev_do1 != localDo1On);
+
+    if (ioChanged) {
+        prev_meter485 = water_meter_ok;
+        prev_level485 = lastRs485Ok;
+        prev_io485 = rs485_io_ok;
+        prev_pump1_mb = pump1_modbus_ok;
+        prev_pump2_mb = pump2_modbus_ok;
+        prev_press_mb = pressure_sensor_ok;
+        prev_outputs = shared_rs485_outputs;
+        prev_inputs = shared_rs485_inputs;
+        prev_di0 = shared_di0;
+        prev_di1 = shared_di1;
+        prev_do0 = localDo0On;
+        prev_do1 = localDo1On;
+
+        auto set_monitor_alpha = [](lv_obj_t *obj, bool on) {
+            if (obj)
+                lv_obj_set_style_bg_opa(obj, on ? LV_OPA_COVER : 100, LV_PART_MAIN | LV_STATE_DEFAULT);
+        };
+
+        // PanelMonitor LEDs
+        set_status_led(ui_Rs485LedMeter, water_meter_ok, 0x22C55E);         // Meter (Slave 1)
+        set_status_led(ui_Rs485LedIo, rs485_io_ok, 0x22C55E);               // RS485 IO (Slave 2)
+        set_status_led(ui_Rs485LedLevel, lastRs485Ok, 0x22C55E);            // Level Sensor (Slave 3)
+        set_status_led(ui_Rs485LedPump1, pump1_modbus_ok, 0x22C55E);        // Inverter Pump 1 (Slave 4)
+        set_status_led(ui_Rs485LedPump2, pump2_modbus_ok, 0x22C55E);        // Inverter Pump 2 (Slave 5)
+        set_status_led(ui_Rs485LedPressure, pressure_sensor_ok, 0x22C55E);  // Pressure Sensor (Slave 6)
+        set_status_led(ui_LedValve, (shared_rs485_outputs & (1u << valve_io_pin)) != 0, 0x22C55E);
+
+        set_monitor_alpha(ui_LocalDI0, shared_di0);
+        set_monitor_alpha(ui_LocalDI1, shared_di1);
+        set_monitor_alpha(ui_LocalDO0, localDo0On);
+        set_monitor_alpha(ui_LocalDO1, localDo1On);
+        lv_obj_t *rs485Di[] = {ui_RS485DI1, ui_RS485DI2, ui_RS485DI3, ui_RS485DI4, ui_RS485DI5, ui_RS485DI6, ui_RS485DI7, ui_RS485DI8};
+        lv_obj_t *rs485Do[] = {ui_RS485CH1, ui_RS485CH2, ui_RS485CH3, ui_RS485CH4, ui_RS485CH5, ui_RS485CH6, ui_RS485CH7, ui_RS485CH8};
+        for (uint8_t i = 0; i < 8; ++i) {
+            set_monitor_alpha(rs485Di[i], rs485_io_ok && ((shared_rs485_inputs >> i) & 1));
+            set_monitor_alpha(rs485Do[i], rs485_io_ok && ((shared_rs485_outputs >> i) & 1));
+        }
     }
 
-    prev_meter485 = lastRs485Ok;
-    prev_level485 = lastRs485Ok;
-    prev_io485 = rs485_io_ok;
-    prev_outputs = shared_rs485_outputs;
-    prev_inputs = shared_rs485_inputs;
-    prev_di0 = shared_di0;
-    prev_di1 = shared_di1;
-    prev_do0 = localDo0On;
-    prev_do1 = localDo1On;
+    // Pump 1 & 2 LEDs (Yellow if alarm, Green if running, Dark/off if stopped)
+    static int prev_p1_state = -1;
+    static int prev_p2_state = -1;
+    int p1_state = shared_pump1_alarm ? 2 : (shared_pump1_running ? 1 : 0);
+    int p2_state = shared_pump2_alarm ? 2 : (shared_pump2_running ? 1 : 0);
+    if (force || p1_state != prev_p1_state) {
+        prev_p1_state = p1_state;
+        set_pump_led(ui_LedPump1, shared_pump1_running, shared_pump1_alarm);
+    }
+    if (force || p2_state != prev_p2_state) {
+        prev_p2_state = p2_state;
+        set_pump_led(ui_LedPump2, shared_pump2_running, shared_pump2_alarm);
+    }
 
-    auto set_monitor_alpha = [](lv_obj_t *obj, bool on) {
-        if (obj)
-            lv_obj_set_style_bg_opa(obj, on ? LV_OPA_COVER : 100, LV_PART_MAIN | LV_STATE_DEFAULT);
+    // Status text in ui_LabelPumpStatus (Auto panel) and ui_LabelPumpStatus1 (Manual panel):
+    // Example: Pressure [ 2.45 bar ]   Pump 1  [ 38.5 Hz  3.8A ]  Pump 2  [ 38.5 Hz  3.8A ]
+    char statusText[128];
+    if (waterSettings.sensorTypeSwitch) {
+        snprintf(statusText, sizeof(statusText),
+                 "Pressure [ SW: %s ]   Pump 1  [ %.1f Hz  %.1fA ]  Pump 2  [ %.1f Hz  %.1fA ]",
+                 shared_pressure_switch ? "ON" : "OFF",
+                 shared_pump1_freq, shared_pump1_current,
+                 shared_pump2_freq, shared_pump2_current);
+    } else {
+        snprintf(statusText, sizeof(statusText),
+                 "Pressure [ %.2f bar ]   Pump 1  [ %.1f Hz  %.1fA ]  Pump 2  [ %.1f Hz  %.1fA ]",
+                 shared_pressure_bar,
+                 shared_pump1_freq, shared_pump1_current,
+                 shared_pump2_freq, shared_pump2_current);
+    }
+    static char prevStatusText[128] = "";
+    if (force || strcmp(prevStatusText, statusText) != 0) {
+        strncpy(prevStatusText, statusText, sizeof(prevStatusText));
+        if (ui_LabelPumpStatus) {
+            lv_label_set_text(ui_LabelPumpStatus, statusText);
+        }
+        if (ui_LabelPumpStatus1) {
+            lv_label_set_text(ui_LabelPumpStatus1, statusText);
+        }
+    }
+
+    if (ui_SwitchAutoPump1 && lv_obj_has_state(ui_SwitchAutoPump1, LV_STATE_CHECKED) != waterSettings.autoPump1)
+        lv_obj_set_state(ui_SwitchAutoPump1, LV_STATE_CHECKED, waterSettings.autoPump1);
+    if (ui_SwitchAutoPump2 && lv_obj_has_state(ui_SwitchAutoPump2, LV_STATE_CHECKED) != waterSettings.autoPump2)
+        lv_obj_set_state(ui_SwitchAutoPump2, LV_STATE_CHECKED, waterSettings.autoPump2);
+
+    auto sync_manual_switch = [](lv_obj_t *sw, bool checked, bool disabled) {
+        if (!sw) return;
+        if (lv_obj_has_state(sw, LV_STATE_CHECKED) != checked)
+            lv_obj_set_state(sw, LV_STATE_CHECKED, checked);
+        const bool isDisabled = lv_obj_has_state(sw, LV_STATE_DISABLED);
+        if (isDisabled != disabled) {
+            if (disabled) {
+                lv_obj_add_state(sw, LV_STATE_DISABLED);
+                lv_obj_remove_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+            } else {
+                lv_obj_remove_state(sw, LV_STATE_DISABLED);
+                lv_obj_add_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+            }
+        }
     };
 
-    // This LED reports the actual Modbus slave 3 transaction status, so it
-    // remains useful even when the water-level sensor (slave 2) is absent.
-    set_status_led(ui_LedMeter485, lastRs485Ok, 0x22C55E);
-    set_status_led(ui_LedLevel485, lastRs485Ok, 0x22C55E);
-    set_status_led(ui_LedIO485, rs485_io_ok, 0x22C55E);
-    set_status_led(ui_LedValve, (shared_rs485_outputs & (1u << 0)) != 0, 0x22C55E);
-    set_status_led(ui_LedPump1, (shared_rs485_outputs & (1u << 1)) != 0, 0x22C55E);
-    set_status_led(ui_LedPump2, (shared_rs485_outputs & (1u << 2)) != 0, 0x22C55E);
+    sync_manual_switch(ui_SwitchManualPump1, waterSettings.manualPump1, waterSettings.autoMode);
+    sync_manual_switch(ui_SwitchManualPump2, waterSettings.manualPump2, waterSettings.autoMode);
+    sync_manual_switch(ui_SwitchValve, waterSettings.manualValve, waterSettings.autoMode);
 
-    // Keep the three manual controls as status indicators as well as controls.
-    // This also reflects automatic output changes while the Manual panel is
-    // open; disabled controls in Auto mode still show the real state.
-    if (ui_ManualPump1)
-        lv_obj_set_state(ui_ManualPump1, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 1)) != 0);
-    if (ui_ManualPump2)
-        lv_obj_set_state(ui_ManualPump2, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 2)) != 0);
-    if (ui_ManualValve)
-        lv_obj_set_state(ui_ManualValve, LV_STATE_CHECKED, (shared_rs485_outputs & (1u << 0)) != 0);
+    if (ui_SwitchSensorType && lv_obj_has_state(ui_SwitchSensorType, LV_STATE_CHECKED) != waterSettings.sensorTypeSwitch)
+        lv_obj_set_state(ui_SwitchSensorType, LV_STATE_CHECKED, waterSettings.sensorTypeSwitch);
 
-    set_monitor_alpha(ui_LocalDI0, shared_di0);
-    set_monitor_alpha(ui_LocalDI1, shared_di1);
-    set_monitor_alpha(ui_LocalDO0, localDo0On);
-    set_monitor_alpha(ui_LocalDO1, localDo1On);
-    lv_obj_t *rs485Di[] = {ui_RS485DI1, ui_RS485DI2, ui_RS485DI3, ui_RS485DI4, ui_RS485DI5, ui_RS485DI6, ui_RS485DI7, ui_RS485DI8};
-    lv_obj_t *rs485Do[] = {ui_RS485CH1, ui_RS485CH2, ui_RS485CH3, ui_RS485CH4, ui_RS485CH5, ui_RS485CH6, ui_RS485CH7, ui_RS485CH8};
-    for (uint8_t i = 0; i < 8; ++i) {
-        set_monitor_alpha(rs485Di[i], rs485_io_ok && ((shared_rs485_inputs >> i) & 1));
-        set_monitor_alpha(rs485Do[i], rs485_io_ok && ((shared_rs485_outputs >> i) & 1));
-    }
+    if (ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED) != waterSettings.autoMode)
+        lv_obj_set_state(ui_ManualAuto, LV_STATE_CHECKED, waterSettings.autoMode);
 }
 
 static void manual_output_event(lv_event_t *e) {
@@ -1994,21 +3438,32 @@ static void manual_output_event(lv_event_t *e) {
     const bool state = lv_obj_has_state(obj, LV_STATE_CHECKED);
     void *userData = lv_event_get_user_data(e);
     const uint8_t output = (uint8_t)(uintptr_t)userData;
-    const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
-    if (autoMode)
-        return;
 
-    // userData: 0 = Pump1 (coil 1), 1 = Pump2 (coil 2), 2 = Valve (coil 0)
+    // userData: 0 = Auto Pump 1, 1 = Auto Pump 2, 2 = Manual Pump 1, 3 = Manual Pump 2, 4 = Valve
     if (output == 0) {
-        waterSettings.manualPump1 = state;
-        set_rs485_output(1, state);
+        waterSettings.autoPump1 = state;
     } else if (output == 1) {
-        waterSettings.manualPump2 = state;
-        set_rs485_output(2, state);
+        waterSettings.autoPump2 = state;
     } else if (output == 2) {
+        if (waterSettings.autoMode) {
+            lv_obj_set_state(obj, LV_STATE_CHECKED, false);
+            return;
+        }
+        waterSettings.manualPump1 = state;
+    } else if (output == 3) {
+        if (waterSettings.autoMode) {
+            lv_obj_set_state(obj, LV_STATE_CHECKED, false);
+            return;
+        }
+        waterSettings.manualPump2 = state;
+    } else if (output == 4) {
+        if (waterSettings.autoMode) {
+            lv_obj_set_state(obj, LV_STATE_CHECKED, false);
+            return;
+        }
         waterSettings.manualValve = state;
         manualValveOverride = state;
-        set_rs485_output(0, state);
+        set_rs485_output(valve_io_pin, state);
     }
     save_water_settings();
     update_manual_leds();
@@ -2037,7 +3492,8 @@ static void select_panel(lv_obj_t *panel) {
         return;
     lv_obj_add_flag(ui_LineChart, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ui_PanelManual, LV_OBJ_FLAG_HIDDEN);
+    if (ui_PanelAuto) lv_obj_add_flag(ui_PanelAuto, LV_OBJ_FLAG_HIDDEN);
+    if (ui_PanelManual) lv_obj_add_flag(ui_PanelManual, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelMonitor, LV_OBJ_FLAG_HIDDEN);
     if (ui_PanelWiFiAndClock) lv_obj_add_flag(ui_PanelWiFiAndClock, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_HIDDEN);
@@ -2060,10 +3516,28 @@ static void select_wifi_clock(lv_event_t *) {
     if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "COMMUNICATION & POWER SETTINGS");
 }
 
+static void select_auto(lv_event_t *) {
+    select_panel(ui_PanelAuto);
+    update_settings_ui();
+    update_mode_ui();
+    update_manual_leds(true);
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "AUTO PUMP CONTROL");
+}
+
 static void select_manual(lv_event_t *) {
     select_panel(ui_PanelManual);
-    update_manual_leds();
-    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "MANUAL CONTROL");
+    update_settings_ui();
+    update_mode_ui();
+    update_manual_leds(true);
+    if (ui_LabelMenu) lv_label_set_text(ui_LabelMenu, "MANUAL PUMP CONTROL");
+}
+
+static void select_auto_manual_menu(lv_event_t *e) {
+    if (waterSettings.autoMode) {
+        select_auto(e);
+    } else {
+        select_manual(e);
+    }
 }
 
 static void select_monitor(lv_event_t *) {
@@ -2162,8 +3636,8 @@ static void update_water_level_ui(float level_pct, float level_cm, float volume_
         lv_label_set_text(ui_LabelFlowRate, text);
 
     set_status_led(ui_LedValve, valve_on, 0x22C55E);
-    set_status_led(ui_LedPump1, pump1_on, 0x22C55E);
-    set_status_led(ui_LedPump2, pump2_on, 0x22C55E);
+    set_pump_led(ui_LedPump1, shared_pump1_running, shared_pump1_alarm);
+    set_pump_led(ui_LedPump2, shared_pump2_running, shared_pump2_alarm);
 
     if (level_cm < waterSettings.alertMinCm) {
         lv_label_set_text(ui_LabelWaterStatus, "LOW LEVEL");
@@ -2204,8 +3678,10 @@ static void update_water_level_simulation() {
     const float flow_rate = 0.0f;
     const bool valve_on = update_automatic_outputs(level_cm);
     const bool autoMode = ui_ManualAuto && lv_obj_has_state(ui_ManualAuto, LV_STATE_CHECKED);
-    const bool pump1_on = autoMode && waterSettings.autoPump1 && shared_pressure_switch;
-    const bool pump2_on = autoMode && waterSettings.autoPump2 && shared_pressure_switch;
+    const float lowerLimit = get_lower_limit_cm();
+    const bool levelOk = level_cm >= lowerLimit;
+    const bool pump1_on = autoMode && waterSettings.autoPump1 && shared_pressure_switch && levelOk && !shared_pump1_overload;
+    const bool pump2_on = autoMode && waterSettings.autoPump2 && shared_pressure_switch && levelOk && !shared_pump2_overload;
 
     if (lvgl_port_lock(10)) {
         update_water_level_ui(level_pct, level_cm, volume_l, flow_rate, valve_on, pump1_on, pump2_on);
@@ -2238,48 +3714,59 @@ static void setup_water_level_chart() {
 void setup_ui_events() {
     lv_obj_add_event_cb(ui_HomeButton, select_chart, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_SettingsButton, select_settings, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_ManualButton, select_manual, LV_EVENT_CLICKED, NULL);
+    if (ui_ManualAutoButton)
+        lv_obj_add_event_cb(ui_ManualAutoButton, select_auto_manual_menu, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_MonitorButton, select_monitor, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_WiFiAndClock, select_wifi_clock, LV_EVENT_CLICKED, NULL);
     // SquareLine marks the child images as clickable, so a touch on an icon
     // may target the image instead of bubbling to its button parent.
     lv_obj_add_event_cb(ui_Image1, select_chart, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image2, select_settings, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_Image3, select_manual, LV_EVENT_CLICKED, NULL);
+    if (ui_Image3)
+        lv_obj_add_event_cb(ui_Image3, select_auto_manual_menu, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image4, select_monitor, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Image6, select_wifi_clock, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetPumpDelay, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
-    lv_obj_add_event_cb(ui_SetOnValve, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetTankCapacity, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetPumpDelay, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetMinAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetMaxAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, save_settings_from_ui, LV_EVENT_READY, NULL);
+    // Navigation buttons between ui_PanelAuto and ui_PanelManual
+    if (ui_ManualButton)
+        lv_obj_add_event_cb(ui_ManualButton, select_manual, LV_EVENT_CLICKED, NULL);
+    if (ui_Image7)
+        lv_obj_add_event_cb(ui_Image7, select_manual, LV_EVENT_CLICKED, NULL);
+    if (ui_AutoButton)
+        lv_obj_add_event_cb(ui_AutoButton, select_auto, LV_EVENT_CLICKED, NULL);
+    if (ui_Image8)
+        lv_obj_add_event_cb(ui_Image8, select_auto, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_add_event_cb(ui_SetOnValve, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetTankCapacity, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeContorl, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetPumpDelay, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetMinAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetMaxAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ui_SetPeriodTimeAlert, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *numericInputs[] = {
+        ui_SetOnValve, ui_SetTankCapacity, ui_SetPeriodTimeContorl,
+        ui_SetMinAlert, ui_SetMaxAlert, ui_SetPeriodTimeAlert,
+        ui_SetLowerLimit, ui_SetPidKp, ui_SetPidKi, ui_SetAccDec,
+        ui_SetPressure, ui_SetSleepFreq, ui_SetSleepDelay,
+        ui_SetSpeedPump1, ui_SetSpeedPump2
+    };
+    for (lv_obj_t *inp : numericInputs) {
+        if (!inp) continue;
+        lv_obj_add_event_cb(inp, save_settings_from_ui, LV_EVENT_DEFOCUSED, NULL);
+        lv_obj_add_event_cb(inp, save_settings_from_ui, LV_EVENT_READY, NULL);
+        lv_obj_add_event_cb(inp, open_numeric_keyboard, LV_EVENT_CLICKED, NULL);
+    }
     lv_obj_add_event_cb(ui_Keyboard, close_numeric_keyboard, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ui_Keyboard, close_numeric_keyboard, LV_EVENT_CANCEL, NULL);
 
-    lv_obj_add_event_cb(ui_ManualPump1, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)0);
-    lv_obj_add_event_cb(ui_ManualPump2, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)1);
-    lv_obj_add_event_cb(ui_ManualValve, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)2);
-    lv_obj_add_event_cb(ui_ManualAuto, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
-    lv_obj_add_event_cb(ui_AutoPump1, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
-    lv_obj_add_event_cb(ui_AutoPump2, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
+    if (ui_SwitchAutoPump1)
+        lv_obj_add_event_cb(ui_SwitchAutoPump1, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)0);
+    if (ui_SwitchAutoPump2)
+        lv_obj_add_event_cb(ui_SwitchAutoPump2, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)1);
+    if (ui_SwitchManualPump1)
+        lv_obj_add_event_cb(ui_SwitchManualPump1, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)2);
+    if (ui_SwitchManualPump2)
+        lv_obj_add_event_cb(ui_SwitchManualPump2, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)3);
+    if (ui_SwitchValve)
+        lv_obj_add_event_cb(ui_SwitchValve, manual_output_event, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)4);
+    if (ui_SwitchSensorType)
+        lv_obj_add_event_cb(ui_SwitchSensorType, sensor_type_event, LV_EVENT_VALUE_CHANGED, NULL);
+    if (ui_ManualAuto)
+        lv_obj_add_event_cb(ui_ManualAuto, save_mode_settings, LV_EVENT_VALUE_CHANGED, NULL);
     for (lv_obj_t *obj : {ui_LocalDO0, ui_LocalDO1})
         if (obj) lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(ui_LocalDO0, local_output_test_event, LV_EVENT_CLICKED, (void *)(uintptr_t)0);
@@ -2320,12 +3807,11 @@ void setup() {
     initCH422G();
     initSDCARD();
 
-    // 4. เริ่มต้นพอร์ต RS485 (GPIO 44 TX, GPIO 43 RX)
-    bool rs485Ok = WS43B.rs485.begin(MODBUS_BAUD_RATE, SERIAL_8N1, WS43B_RS485_RX_PIN, WS43B_RS485_TX_PIN);
+    // 4. เริ่มต้นพอร์ต RS485 (GPIO 44 TX, GPIO 43 RX) 9600 baud, 8E1
+    bool rs485Ok = WS43B.rs485.begin(MODBUS_BAUD_RATE, SERIAL_8E1, WS43B_RS485_RX_PIN, WS43B_RS485_TX_PIN);
 
     // PCF85063 shares the board I2C pins with the touch/IO hardware.
-    Wire.begin(WS43B_I2C_SDA_PIN, WS43B_I2C_SCL_PIN, WS43B_I2C_DEFAULT_FREQ);
-    const bool rtcOk = rtc.begin(Wire, WS43B_I2C_ADDR_PCF85063);
+    const bool rtcOk = rtc.begin(WS43B_I2C_ADDR_PCF85063);
     Serial.println(rtcOk ? "[RTC] PCF85063 detected at 0x51" : "[RTC] PCF85063 not detected");
     if (rtcOk) {
         RtcDateTime rtcValue;
@@ -2341,9 +3827,12 @@ void setup() {
 
     // 5. เริ่มต้น ModbusMaster โดยผูกเข้ากับ Serial1
     modbus.begin(MODBUS_SLAVE_ID, Serial1);
+    modbus.idle(modbus_idle_yield);
     rs485Io.begin(RS485_IO_SLAVE_ID, Serial1);
+    rs485Io.idle(modbus_idle_yield);
 #if WATER_METER_SENSOR_PRESENT
     waterMeter.begin(WATER_METER_SLAVE_ID, Serial1);
+    waterMeter.idle(modbus_idle_yield);
 #endif
 
     // 6. เริ่มต้น CAN Bus (TWAI: GPIO 15 TX, GPIO 16 RX)
@@ -2369,7 +3858,7 @@ void setup() {
                             "comm_task",     // Task name
                             8192,            // Stack size in bytes
                             NULL,            // Parameters
-                            2,               // Priority (ต่ำกว่า LVGL ที่อยู่ระดับ 3)
+                            1,               // Priority (1 is above idle 0, yields nicely)
                             &commTaskHandle, // Task handle
                             0                // 🔥 รันที่ CORE 0
     );
@@ -2377,6 +3866,7 @@ void setup() {
     Serial.println("[SYSTEM] High-speed display pipeline active.");
 
     bootTimeMs = millis();
+    autoRestartStartMs = millis();
     lastUserActivityMs = millis();
 
     DO0_OFF;
@@ -2384,6 +3874,11 @@ void setup() {
 }
 
 void loop() {
+    if (isOtaUpdating) {
+        handle_ota_loop();
+        vTaskDelay(pdMS_TO_TICKS(1));
+        return;
+    }
 
     // 3. อัปเดตเกจวัดระดับน้ำและกราฟแนวโน้มแบบ Real-Time จากข้อมูล Modbus
     update_auto_pumps_from_pressure();
@@ -2412,9 +3907,9 @@ void loop() {
             const float volume_l = 0.0f; // Water meter is not installed yet.
             const float flow_rate = 0.0f;
 #endif
-            const bool valveOn = (shared_rs485_outputs & (1u << 0)) != 0;
-            const bool pump1On = (shared_rs485_outputs & (1u << 1)) != 0;
-            const bool pump2On = (shared_rs485_outputs & (1u << 2)) != 0;
+            const bool valveOn = (shared_rs485_outputs & (1u << valve_io_pin)) != 0;
+            const bool pump1On = (shared_rs485_outputs & (1u << pump1_io_pin)) != 0;
+            const bool pump2On = (shared_rs485_outputs & (1u << pump2_io_pin)) != 0;
             update_water_level_ui(level_pct, level_cm, volume_l, flow_rate, valveOn, pump1On, pump2On);
             update_manual_leds();
             lvgl_port_unlock();
@@ -2440,7 +3935,7 @@ void loop() {
     }
 #endif
 
-    if (lvgl_port_lock(2)) {
+    if (lvgl_port_lock(25)) {
         update_manual_leds();
         if (millis() - lastRtcUpdateMs >= 1000) {
             lastRtcUpdateMs = millis();
@@ -2450,7 +3945,28 @@ void loop() {
         lvgl_port_unlock();
     }
 
+    // ---- Overload / Inverter Trip Protection ----
+    if (shared_pump1_alarm && waterSettings.manualPump1 && !waterSettings.autoMode) {
+        waterSettings.manualPump1 = false;
+        save_water_settings();
+        if (lvgl_port_lock(10)) {
+            update_mode_ui();
+            lvgl_port_unlock();
+        }
+        publish_mqtt_data();
+    }
+    if (shared_pump2_alarm && waterSettings.manualPump2 && !waterSettings.autoMode) {
+        waterSettings.manualPump2 = false;
+        save_water_settings();
+        if (lvgl_port_lock(10)) {
+            update_mode_ui();
+            lvgl_port_unlock();
+        }
+        publish_mqtt_data();
+    }
+
     handle_mqtt_loop();
+    handle_ota_loop();
 
     // ---- Auto Backlight ----
     if (autoBacklightEnabled && isBacklightOn) {
@@ -2458,15 +3974,15 @@ void loop() {
         if (idleMs >= autoBacklightMin * 60000UL) {
             BL_OFF;
             isBacklightOn = false;
-            Serial.println("[SYSTEM] Backlight OFF (auto)");
+            Serial.printf("[SYSTEM] Backlight OFF (idle %lu ms >= %lu min)\n", (unsigned long)idleMs, (unsigned long)autoBacklightMin);
         }
     }
 
     // ---- Auto Restart ----
     if (autoRestartEnabled) {
-        const uint32_t uptimeMs = millis() - bootTimeMs;
-        if (uptimeMs >= autoRestartMin * 60000UL) {
-            Serial.println("[SYSTEM] Auto restart triggered");
+        const uint32_t elapsedMs = millis() - autoRestartStartMs;
+        if (elapsedMs >= autoRestartMin * 60000UL) {
+            Serial.printf("[SYSTEM] Auto restart triggered (after %lu min)\n", autoRestartMin);
             delay(500);
             ESP.restart();
         }

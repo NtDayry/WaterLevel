@@ -1,4 +1,6 @@
 #include "pcf85063.h"
+#include <LovyanGFX.hpp>
+#include "waveshare_ch422g.h"
 
 namespace {
 uint8_t fromBcd(uint8_t value) { return (uint8_t)((value >> 4) * 10 + (value & 0x0F)); }
@@ -11,52 +13,63 @@ bool validDateTime(const RtcDateTime &value) {
 }
 
 bool Pcf85063::begin(TwoWire &wire, uint8_t address) {
-    _wire = &wire;
+    (void)wire;
+    return begin(address);
+}
+
+bool Pcf85063::begin(uint8_t address) {
     _address = address;
-    _wire->beginTransmission(_address);
-    _available = _wire->endTransmission() == 0;
+    if (i2c_bus_lock(50)) {
+        uint8_t reg = 0x04;
+        uint8_t dummy = 0;
+        _available = lgfx::i2c::transactionWriteRead(0, _address, &reg, 1, &dummy, 1, 400000).has_value();
+        i2c_bus_unlock();
+    }
     return _available;
 }
 
 bool Pcf85063::read(RtcDateTime &dateTime) {
-    if (!_wire || !_available)
+    if (!_available)
         return false;
 
-    _wire->beginTransmission(_address);
-    _wire->write(0x04); // seconds register; 0x03 is the RAM byte
-    if (_wire->endTransmission(false) != 0 || _wire->requestFrom(_address, (uint8_t)7) != 7)
+    uint8_t buf[7] = {0};
+    uint8_t reg = 0x04;
+    bool ok = false;
+    if (i2c_bus_lock(50)) {
+        ok = lgfx::i2c::transactionWriteRead(0, _address, &reg, 1, buf, 7, 400000).has_value();
+        i2c_bus_unlock();
+    }
+    if (!ok)
         return false;
 
-    const uint8_t seconds = (uint8_t)_wire->read();
-    const uint8_t minutes = (uint8_t)_wire->read();
-    const uint8_t hours = (uint8_t)_wire->read();
-    const uint8_t days = (uint8_t)_wire->read();
-    (void)_wire->read(); // weekday
-    const uint8_t months = (uint8_t)_wire->read();
-    const uint8_t years = (uint8_t)_wire->read();
-
-    dateTime.second = fromBcd(seconds & 0x7F);
-    dateTime.minute = fromBcd(minutes & 0x7F);
-    dateTime.hour = fromBcd(hours & 0x3F);
-    dateTime.day = fromBcd(days & 0x3F);
-    dateTime.month = fromBcd(months & 0x1F);
-    dateTime.year = (uint16_t)(2000 + fromBcd(years));
+    dateTime.second = fromBcd(buf[0] & 0x7F);
+    dateTime.minute = fromBcd(buf[1] & 0x7F);
+    dateTime.hour = fromBcd(buf[2] & 0x3F);
+    dateTime.day = fromBcd(buf[3] & 0x3F);
+    // buf[4] is weekday
+    dateTime.month = fromBcd(buf[5] & 0x1F);
+    dateTime.year = (uint16_t)(2000 + fromBcd(buf[6]));
     return validDateTime(dateTime);
 }
 
 bool Pcf85063::write(const RtcDateTime &dateTime) {
-    if (!_wire || !_available || !validDateTime(dateTime))
+    if (!_available || !validDateTime(dateTime))
         return false;
 
-    _wire->beginTransmission(_address);
-    _wire->write(0x04);
-    _wire->write(toBcd(dateTime.second));
-    _wire->write(toBcd(dateTime.minute));
-    _wire->write(toBcd(dateTime.hour));
-    _wire->write(toBcd(dateTime.day));
-    _wire->write((uint8_t)0); // weekday; PCF85063 recalculates no weekday itself
-    _wire->write(toBcd(dateTime.month));
-    _wire->write(toBcd((uint8_t)(dateTime.year - 2000)));
-    return _wire->endTransmission() == 0;
-}
+    uint8_t data[8];
+    data[0] = 0x04;
+    data[1] = toBcd(dateTime.second);
+    data[2] = toBcd(dateTime.minute);
+    data[3] = toBcd(dateTime.hour);
+    data[4] = toBcd(dateTime.day);
+    data[5] = 0; // weekday
+    data[6] = toBcd(dateTime.month);
+    data[7] = toBcd((uint8_t)(dateTime.year - 2000));
 
+    bool ok = false;
+    if (i2c_bus_lock(50)) {
+        ok = lgfx::i2c::transactionWrite(0, _address, data, 8, 400000).has_value();
+        i2c_bus_unlock();
+    }
+    return ok;
+}

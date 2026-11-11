@@ -5,9 +5,10 @@ SET(SOURCES screens/ui_Screen1.c
     images/ui_img_menu_open_png.c
     images/ui_img_house_png.c
     images/ui_img_settings_png.c
-    images/ui_img_guide_png.c
+    images/ui_img_gain_png.c
     images/ui_img_testing_png.c
     images/ui_img_1757177593.c
+    images/ui_img_servo_png.c
     fonts/ui_font_Chakra130.c
     fonts/ui_font_Chakra50.c
     fonts/ui_font_Font1.c

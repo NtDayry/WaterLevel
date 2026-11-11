@@ -40,9 +40,10 @@ extern lv_obj_t * ui____initial_actions0;
 LV_IMG_DECLARE(ui_img_menu_open_png);    // assets/menu_open.png
 LV_IMG_DECLARE(ui_img_house_png);    // assets/house.png
 LV_IMG_DECLARE(ui_img_settings_png);    // assets/settings.png
-LV_IMG_DECLARE(ui_img_guide_png);    // assets/guide.png
+LV_IMG_DECLARE(ui_img_gain_png);    // assets/gain.png
 LV_IMG_DECLARE(ui_img_testing_png);    // assets/testing.png
 LV_IMG_DECLARE(ui_img_1757177593);    // assets/wifi-signal.png
+LV_IMG_DECLARE(ui_img_servo_png);    // assets/servo.png
 
 // FONTS
 LV_FONT_DECLARE(ui_font_Chakra130);
