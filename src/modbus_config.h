@@ -49,7 +49,7 @@
 // 4. Inverter OMRON SYSDRIVE 3G3JZ (Pump 1: ID 4, Pump 2: ID 5)
 #define DEFAULT_INVERTER_PUMP1_SLAVE_ID 4
 #define DEFAULT_INVERTER_PUMP2_SLAVE_ID 5
-#define DEFAULT_INVERTER_POLL_MS        200
+#define DEFAULT_INVERTER_POLL_MS        250
 
 // 5. Modbus Pressure Transmitter (Slave ID 6, Reg 0, 0-6.00 bar)
 #define DEFAULT_PRESSURE_SLAVE_ID    6

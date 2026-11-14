@@ -132,10 +132,18 @@ static constexpr uint8_t rs485_ch8_io_pin = 7;
 static constexpr uint8_t pressure_switch_io_pin = rs485_di1_io_pin;
 static constexpr uint8_t pump1_overload_io_pin = rs485_di2_io_pin;
 static constexpr uint8_t pump2_overload_io_pin = rs485_di3_io_pin;
-static constexpr uint8_t pump1_io_pin = rs485_ch1_io_pin;
-static constexpr uint8_t pump2_io_pin = rs485_ch2_io_pin;
-static constexpr uint8_t valve_io_pin = rs485_ch3_io_pin;
-static constexpr uint8_t alarm_io_pin = rs485_ch4_io_pin;
+
+// RS485 output coil mapping (Relay / DO module)
+static constexpr uint8_t pump1_run_io_pin   = rs485_ch1_io_pin; // CH1: ไฟสถานะรัน pump1
+static constexpr uint8_t pump2_run_io_pin   = rs485_ch2_io_pin; // CH2: ไฟสถานะรัน pump2
+static constexpr uint8_t pump1_alarm_io_pin = rs485_ch3_io_pin; // CH3: Alarm ของ pump1
+static constexpr uint8_t pump2_alarm_io_pin = rs485_ch4_io_pin; // CH4: Alarm ของ pump2
+static constexpr uint8_t alarm_io_pin       = rs485_ch5_io_pin; // CH5: Alarm ของระบบ alarm_io_pin
+static constexpr uint8_t valve_io_pin       = rs485_ch6_io_pin; // CH6: valve_io_pin
+
+// Compatibility aliases
+static constexpr uint8_t pump1_io_pin = pump1_run_io_pin;
+static constexpr uint8_t pump2_io_pin = pump2_run_io_pin;
 
 // Water-level gauge created inside the SquareLine placeholder object.
 static lv_chart_series_t *waterLevelChartSeries = NULL;
@@ -152,6 +160,7 @@ static bool lastRs485Ok = false;
 static float configuredLevelMaxCm();
 static void set_output_state(uint8_t output, bool on);
 static void set_rs485_output(uint8_t coil, bool on);
+static void update_pump_status_outputs();
 static void update_auto_pumps_from_pressure(float levelCm = -1.0f);
 
 static Pcf85063 rtc;
@@ -1792,8 +1801,11 @@ static void setup_ota() {
             BL_ON;
             isBacklightOn = true;
 
-            set_rs485_output(pump1_io_pin, false);
-            set_rs485_output(pump2_io_pin, false);
+            set_rs485_output(pump1_run_io_pin, false);
+            set_rs485_output(pump2_run_io_pin, false);
+            set_rs485_output(pump1_alarm_io_pin, false);
+            set_rs485_output(pump2_alarm_io_pin, false);
+            set_rs485_output(alarm_io_pin, false);
             set_rs485_output(valve_io_pin, false);
 
             // 2. Suspend LVGL task safely and wait for DMA to finish
@@ -2722,7 +2734,7 @@ static void sendInverterCmd(uint8_t slaveId, bool run, float targetFreq) {
     uint8_t res = modbus.writeSingleRegister(0x2102, fVal);
 
     if (res == modbus.ku8MBSuccess) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
         WS43B.rs485.clearRxBuffer();
 
         // Control command register 0x2101 (Bit 5 ComCtrl, Bit 4 ComRef, Bit 0 Run)
@@ -2742,7 +2754,7 @@ static bool sendInverterAccDec(uint8_t slaveId, float accDecSec) {
 
     // 1. Write Acceleration Time 1 (0x0109)
     uint8_t res1 = modbus.writeSingleRegister(0x0109, rawVal);
-    vTaskDelay(pdMS_TO_TICKS(8));
+    vTaskDelay(pdMS_TO_TICKS(10));
     WS43B.rs485.clearRxBuffer();
 
     // 2. Write Deceleration Time 1 (0x010A)
@@ -2758,7 +2770,8 @@ static bool sendInverterAccDec(uint8_t slaveId, float accDecSec) {
 
 static void pollInverter(uint8_t slaveId, volatile float &outFreq, volatile float &outCurr,
                          volatile uint16_t &outStatus, volatile bool &outRunning,
-                         volatile bool &outAlarm, volatile bool &modbusOk) {
+                         volatile bool &outAlarm, volatile bool &modbusOk,
+                         uint8_t &failCount) {
     modbus.begin(slaveId, Serial1);
     modbus.idle(modbus_idle_yield);
     WS43B.rs485.clearRxBuffer();
@@ -2766,13 +2779,14 @@ static void pollInverter(uint8_t slaveId, volatile float &outFreq, volatile floa
     // Read 0x2120 - 0x2121 (Status bit and Error code)
     uint8_t res = modbus.readHoldingRegisters(0x2120, 2);
     if (res == modbus.ku8MBSuccess) {
+        failCount = 0;
         modbusOk = true;
         uint16_t st = modbus.getResponseBuffer(0);
         outStatus = st;
         outRunning = (st & 0x0001) != 0;
         outAlarm = (st & 0x0018) != 0; // Bit 3 (Trip) or Bit 4 (Alarm)
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
         WS43B.rs485.clearRxBuffer();
 
         // Read 0x2124 - 0x2126 (Output Frequency, Voltage, Current)
@@ -2784,31 +2798,40 @@ static void pollInverter(uint8_t slaveId, volatile float &outFreq, volatile floa
             outCurr = (rawC > 300) ? ((float)rawC / 100.0f) : ((float)rawC / 10.0f);
         }
     } else {
-        modbusOk = false;
-        outRunning = false;
+        if (failCount < 5) failCount++;
+        // ป้องกันไฟสถานะกระพริบติดๆ ดับๆ: ต้องพลาดติดต่อกัน 3 ครั้งขึ้นไปจึงจะตัดสินว่า Offline
+        if (failCount >= 3) {
+            modbusOk = false;
+            outRunning = false;
+        }
     }
 }
 
 static void pollPressureSensor() {
+    static uint8_t pressFailCount = 0;
     modbus.begin(PRESSURE_SLAVE_ID, Serial1);
     modbus.idle(modbus_idle_yield);
     WS43B.rs485.clearRxBuffer();
 
     uint8_t result = modbus.readHoldingRegisters(PRESSURE_START_REG, 1);
     if (result == modbus.ku8MBIllegalFunction) {
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(5));
         WS43B.rs485.clearRxBuffer();
         result = modbus.readInputRegisters(PRESSURE_START_REG, 1);
     }
 
     if (result == modbus.ku8MBSuccess) {
+        pressFailCount = 0;
         pressure_sensor_ok = true;
         uint16_t raw = modbus.getResponseBuffer(0);
         // ID6, Reg 0, 0 - 6.00 bar:
         float p = (raw > 600) ? ((float)raw / 1000.0f) : ((float)raw / 100.0f);
         shared_pressure_bar = p;
     } else {
-        pressure_sensor_ok = false;
+        if (pressFailCount < 5) pressFailCount++;
+        if (pressFailCount >= 3) {
+            pressure_sensor_ok = false;
+        }
     }
 }
 
@@ -2860,15 +2883,15 @@ void commTask(void *param) {
         }
 
         // 3. อ่านค่า Pressure Transmitter (Slave ID 6, Reg 0)
-        const uint32_t pressPollInterval = pressure_sensor_ok ? DEFAULT_PRESSURE_POLL_MS : 1000;
+        const uint32_t pressPollInterval = pressure_sensor_ok ? DEFAULT_PRESSURE_POLL_MS : 2500;
         if (millis() - lastPressurePollTime >= pressPollInterval) {
             lastPressurePollTime = millis();
             pollPressureSensor();
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        // 4. Inverter PID & Sleep Controller Logic (คำนวณและสั่งงานทุก 200ms)
-        if (millis() - lastPidComputeTime >= 200) {
+        // 4. Inverter PID & Sleep Controller Logic (คำนวณและสั่งงานทุก 100ms)
+        if (millis() - lastPidComputeTime >= 100) {
             const float dt = (millis() - lastPidComputeTime) / 1000.0f;
             lastPidComputeTime = millis();
 
@@ -3009,7 +3032,7 @@ void commTask(void *param) {
                     sendInverterCmd(INVERTER_PUMP1_SLAVE_ID, p1TargetRun, p1TargetFreq);
                     vTaskDelay(pdMS_TO_TICKS(10));
                 }
-                if (p2TargetRun || stateChanged) {
+                if (p2TargetRun || (stateChanged && pump2_modbus_ok)) {
                     sendInverterCmd(INVERTER_PUMP2_SLAVE_ID, p2TargetRun, p2TargetFreq);
                     vTaskDelay(pdMS_TO_TICKS(10));
                 }
@@ -3029,7 +3052,7 @@ void commTask(void *param) {
                     }
                     vTaskDelay(pdMS_TO_TICKS(10));
                 }
-                if (abs(currentAccDec - lastSentAccDecP2) > 0.05f) {
+                if (pump2_modbus_ok && abs(currentAccDec - lastSentAccDecP2) > 0.05f) {
                     if (sendInverterAccDec(INVERTER_PUMP2_SLAVE_ID, currentAccDec)) {
                         lastSentAccDecP2 = currentAccDec;
                     }
@@ -3038,15 +3061,32 @@ void commTask(void *param) {
             }
         }
 
-        // 5. อ่านสถานะ Inverter 1 & Inverter 2
-        const uint32_t invPollInterval = (pump1_modbus_ok || pump2_modbus_ok) ? DEFAULT_INVERTER_POLL_MS : 1200;
-        if (millis() - lastInverterPollTime >= invPollInterval) {
-            lastInverterPollTime = millis();
+        // 5. อ่านสถานะ Inverter 1 & Inverter 2 แยกอิสระ สลับคิวกันเพื่อไม่ให้แย่งบัสพร้อมกัน
+        static unsigned long lastP1PollTime = 0;
+        static unsigned long lastP2PollTime = 0;
+        static uint8_t p1FailCount = 0;
+        static uint8_t p2FailCount = 0;
+        static bool initP2Offset = false;
+        if (!initP2Offset) {
+            initP2Offset = true;
+            // เหลื่อมเวลาครึ่งรอบ เพื่อไม่ให้ Inverter 1 และ 2 ส่งคำถามชนกันในมิลลิวินาทีเดียวกัน
+            lastP2PollTime = millis() + (DEFAULT_INVERTER_POLL_MS / 2);
+        }
+
+        const uint32_t p1Interval = pump1_modbus_ok ? DEFAULT_INVERTER_POLL_MS : 1000;
+        const uint32_t p2Interval = pump2_modbus_ok ? DEFAULT_INVERTER_POLL_MS : 1000;
+
+        if (millis() - lastP1PollTime >= p1Interval) {
+            lastP1PollTime = millis();
             pollInverter(INVERTER_PUMP1_SLAVE_ID, shared_pump1_freq, shared_pump1_current,
-                         shared_pump1_status, shared_pump1_running, shared_pump1_alarm, pump1_modbus_ok);
+                         shared_pump1_status, shared_pump1_running, shared_pump1_alarm, pump1_modbus_ok, p1FailCount);
             vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        if (millis() - lastP2PollTime >= p2Interval) {
+            lastP2PollTime = millis();
             pollInverter(INVERTER_PUMP2_SLAVE_ID, shared_pump2_freq, shared_pump2_current,
-                         shared_pump2_status, shared_pump2_running, shared_pump2_alarm, pump2_modbus_ok);
+                         shared_pump2_status, shared_pump2_running, shared_pump2_alarm, pump2_modbus_ok, p2FailCount);
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
@@ -3205,6 +3245,17 @@ static float get_lower_limit_cm() {
     return limit;
 }
 
+static void update_pump_status_outputs() {
+    // 1. ไฟสถานะรัน Pump 1 (CH1) และ Pump 2 (CH2)
+    set_rs485_output(pump1_run_io_pin, shared_pump1_running);
+    set_rs485_output(pump2_run_io_pin, shared_pump2_running);
+
+    // 2. ไฟ Alarm ของ Pump 1 (CH3) และ Pump 2 (CH4)
+    // ติดเมื่อ Inverter แจ้ง Alarm/Trip หรือเกิด Overload จากสวิตช์ DI
+    set_rs485_output(pump1_alarm_io_pin, shared_pump1_alarm || shared_pump1_overload);
+    set_rs485_output(pump2_alarm_io_pin, shared_pump2_alarm || shared_pump2_overload);
+}
+
 static void update_auto_pumps_from_pressure(float levelCm) {
     // Inverter PID and sleep control is managed on Core 0 in commTask()
 }
@@ -3262,6 +3313,8 @@ static bool update_automatic_outputs(float levelCm) {
                           (alertHighSince != 0 && now - alertHighSince >= requiredMs);
     alertOutputOn = timedOut;
     set_rs485_output(alarm_io_pin, alertOutputOn);
+
+    update_pump_status_outputs();
     return valveOn;
 }
 
@@ -3934,6 +3987,8 @@ void loop() {
         }
     }
 #endif
+
+    update_pump_status_outputs();
 
     if (lvgl_port_lock(25)) {
         update_manual_leds();
